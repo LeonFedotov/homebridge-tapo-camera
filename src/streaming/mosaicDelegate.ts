@@ -273,6 +273,7 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
         break;
       }
       case this.hap.StreamRequestTypes.STOP:
+        this.log.info(`[${this.opts.name}] client requested STOP`);
         this.stopStream(request.sessionID);
         callback();
         break;
@@ -328,7 +329,10 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
         this.stopStream(request.sessionID);
       }, timeout);
     };
-    info.videoReturnSocket.on("error", () => this.stopStream(request.sessionID));
+    info.videoReturnSocket.on("error", (err) => {
+      this.log.warn(`[${this.opts.name}] return socket error: ${err.message}`);
+      this.stopStream(request.sessionID);
+    });
     info.videoReturnSocket.on("message", armIdleTimeout);
     armIdleTimeout();
 
