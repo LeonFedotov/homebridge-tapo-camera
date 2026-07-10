@@ -23,6 +23,7 @@ import {
   decideTier,
   DEFAULT_MAIN_TIER,
   DEFAULT_SUB_TIER,
+  shouldApplyReconfigure,
   TierDecision,
   TierMeta,
 } from "./tierPolicy";
@@ -51,6 +52,7 @@ type ActiveSession = {
   audioPt: number;
   mtu: number;
   respawns: number;
+  lastChangeAt: number;
 };
 
 export type TapoStreamingDelegateOptions = {
@@ -219,7 +221,7 @@ export class TapoStreamingDelegate implements CameraStreamingDelegate {
           break;
         }
         const video = request.video;
-        const decision = decideTier(
+        const next = decideTier(
           {
             width: video.width || session.decision.width,
             height: video.height || session.decision.height,
@@ -231,10 +233,25 @@ export class TapoStreamingDelegate implements CameraStreamingDelegate {
           this.opts.subTier ?? DEFAULT_SUB_TIER,
           this.opts.forceTier ?? "auto"
         );
-        session.decision = decision;
+        if (
+          !shouldApplyReconfigure(
+            session.decision,
+            next,
+            Date.now() - session.lastChangeAt
+          )
+        ) {
+          this.log.debug(
+            `[${this.opts.name}] Reconfigure damped: ${next.source}/${next.mode} ` +
+              `${next.width}x${next.height} ${next.bitrateKbps}kbps`
+          );
+          callback();
+          break;
+        }
+        session.decision = next;
+        session.lastChangeAt = Date.now();
         this.log.info(
-          `[${this.opts.name}] Reconfiguring: ${decision.source}/${decision.mode} ` +
-            `${decision.width}x${decision.height}@${decision.fps} ${decision.bitrateKbps}kbps`
+          `[${this.opts.name}] Reconfiguring: ${next.source}/${next.mode} ` +
+            `${next.width}x${next.height}@${next.fps} ${next.bitrateKbps}kbps`
         );
         const old = session.ffmpeg;
         session.ffmpeg = null;
@@ -301,6 +318,7 @@ export class TapoStreamingDelegate implements CameraStreamingDelegate {
       audioPt: request.audio.pt,
       mtu: request.video.mtu || 1316,
       respawns: 0,
+      lastChangeAt: Date.now(),
     };
 
     const armIdleTimeout = () => {

@@ -39,6 +39,40 @@ export const DEFAULT_SUB_TIER: TierMeta = {
 
 const even = (n: number) => Math.max(2, Math.floor(n / 2) * 2);
 
+/** Minimum stability window before an upgrade reconfigure is honored. */
+export const UPGRADE_DAMPING_MS = 15_000;
+
+/**
+ * Damping for RECONFIGURE storms: every applied reconfigure respawns the
+ * session encoder, and the brief gap can read as "link trouble" to the
+ * client, which then downgrades — a feedback oscillator. Downgrades apply
+ * immediately (protect the link); upgrades are rate-limited; no-op changes
+ * are ignored.
+ */
+export function shouldApplyReconfigure(
+  prev: TierDecision,
+  next: TierDecision,
+  msSinceLastChange: number
+): boolean {
+  const prevArea = prev.width * prev.height;
+  const nextArea = next.width * next.height;
+  const sameShape =
+    prev.source === next.source &&
+    prev.mode === next.mode &&
+    prevArea === nextArea;
+  const bitrateDelta = Math.abs(next.bitrateKbps - prev.bitrateKbps);
+  if (sameShape && bitrateDelta <= prev.bitrateKbps * 0.1) {
+    return false; // effectively unchanged — don't interrupt the stream
+  }
+  const isUpgrade =
+    nextArea > prevArea ||
+    (nextArea === prevArea && next.bitrateKbps > prev.bitrateKbps);
+  if (!isUpgrade) {
+    return true; // downgrades always apply immediately
+  }
+  return msSinceLastChange >= UPGRADE_DAMPING_MS;
+}
+
 /**
  * Map what the HomeKit client negotiated to a relay tier and transport mode.
  *
