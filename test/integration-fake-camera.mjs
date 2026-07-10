@@ -180,9 +180,10 @@ mosaicSink.on("message", () => mosaicPackets++);
 mosaicSink.bind(mosaicSinkPort);
 
 const mosaicArgs = buildMosaicArgs({
-  sourceUrls: [
-    `rtsp://127.0.0.1:${rtspPort}/fake_sub`,
-    `rtsp://127.0.0.1:${rtspPort}/fake2_sub`,
+  totalSlots: 2,
+  tiles: [
+    { slot: 0, url: `rtsp://127.0.0.1:${rtspPort}/fake_sub` },
+    { slot: 1, url: `rtsp://127.0.0.1:${rtspPort}/fake2_sub` },
   ],
   fps: 10,
   width: 640,

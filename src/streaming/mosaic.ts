@@ -1,90 +1,90 @@
 import { RtpTarget } from "./ffmpegArgs";
 
-// Composites N camera sub-streams into a single grid via ffmpeg xstack, then
-// scales/bitrate-caps to what HomeKit negotiated. Pure functions, locked by
-// test/mosaic.test.js. Inputs come from the local relay (never the cameras),
-// so the mosaic adds no camera-side load and only runs while viewed.
+// Composites camera tiles onto a "loading" base canvas via ffmpeg overlay.
+// Pure functions, locked by test/mosaic.test.js.
 //
-// The grid is composed at a fixed 1280x720 canvas (tile geometry), then scaled
-// to the negotiated output size. Honoring the negotiated bitrate is essential:
-// an uncapped ~1Mbps mosaic pushed through a ~300kbps relay never assembles a
-// decodable stream on the client — endless spinner while snapshots still work.
+// Design (a glance view — smooth & cheap beats sharp):
+// - A lavfi color base drives the timeline, so output starts IMMEDIATELY and
+//   never blocks on a slow/cold input (verified: a late input doesn't stall
+//   the base).
+// - Only READY sources are added as inputs. A dead/not-yet-ready source is
+//   simply left as a base "loading" tile — never referenced, so it can't
+//   stall or kill the graph (verified: a 404 input aborts ffmpeg).
+// - The delegate re-spawns with more tiles as sources warm up.
 
-export const MOSAIC_CANVAS_W = 1280;
-export const MOSAIC_CANVAS_H = 720;
+export const LOADING_BG = "0x14161c"; // base canvas ("loading") color
 
-export type MosaicPlan = {
+export type MosaicGeometry = {
   cols: number;
   rows: number;
   tileW: number;
   tileH: number;
 };
 
-/** Smallest square-ish grid that holds n tiles, tiles sized to a 1280x720 canvas. */
-export function planMosaic(n: number): MosaicPlan {
-  const cols = Math.ceil(Math.sqrt(n));
-  const rows = Math.ceil(n / cols);
-  const tileW = Math.max(2, Math.floor(MOSAIC_CANVAS_W / cols / 2) * 2);
-  const tileH = Math.max(2, Math.floor(MOSAIC_CANVAS_H / rows / 2) * 2);
+/** Grid geometry for `slots` tiles at the given output size. */
+export function mosaicGeometry(slots: number, width: number, height: number): MosaicGeometry {
+  const cols = Math.ceil(Math.sqrt(slots));
+  const rows = Math.ceil(slots / cols);
+  const tileW = Math.max(2, Math.floor(width / cols / 2) * 2);
+  const tileH = Math.max(2, Math.floor(height / rows / 2) * 2);
   return { cols, rows, tileW, tileH };
 }
 
+export type MosaicTile = { slot: number; url: string };
+
 /**
- * filter_complex that letterboxes each input into its tile (preserving aspect
- * ratio) and lays them out on a black-filled grid, ending at label `outLabel`.
+ * filter_complex overlaying each ready tile onto the base at its grid slot.
+ * Returns null when there are no ready tiles (caller maps the base directly).
  */
-export function buildMosaicFilter(n: number, plan: MosaicPlan, outLabel = "v"): string {
+export function buildMosaicFilter(
+  tiles: MosaicTile[],
+  geo: MosaicGeometry
+): string | null {
+  if (tiles.length === 0) return null;
   const parts: string[] = [];
-  const labels: string[] = [];
-  for (let i = 0; i < n; i++) {
+  let cur = "0:v"; // input 0 is the lavfi base
+  tiles.forEach((tile, i) => {
+    const inLabel = `${i + 1}:v`;
     parts.push(
-      `[${i}:v]scale=${plan.tileW}:${plan.tileH}:force_original_aspect_ratio=decrease,` +
-        `pad=${plan.tileW}:${plan.tileH}:(ow-iw)/2:(oh-ih)/2,setsar=1[t${i}]`
+      `[${inLabel}]scale=${geo.tileW}:${geo.tileH}:force_original_aspect_ratio=decrease,` +
+        `pad=${geo.tileW}:${geo.tileH}:(ow-iw)/2:(oh-ih)/2,setsar=1[t${i}]`
     );
-    labels.push(`[t${i}]`);
-  }
-  const layout: string[] = [];
-  for (let i = 0; i < n; i++) {
-    const col = i % plan.cols;
-    const row = Math.floor(i / plan.cols);
-    layout.push(`${col * plan.tileW}_${row * plan.tileH}`);
-  }
-  parts.push(
-    `${labels.join("")}xstack=inputs=${n}:layout=${layout.join("|")}:fill=black[${outLabel}]`
-  );
+    const col = tile.slot % geo.cols;
+    const row = Math.floor(tile.slot / geo.cols);
+    const out = i === tiles.length - 1 ? "v" : `o${i}`;
+    parts.push(`[${cur}][t${i}]overlay=${col * geo.tileW}:${row * geo.tileH}:eof_action=pass[${out}]`);
+    cur = out;
+  });
   return parts.join(";");
 }
 
 export type MosaicArgsOptions = {
-  /** Local relay URLs (sub tier) of every member camera. */
-  sourceUrls: string[];
-  fps: number;
-  /** Negotiated output size (scaled down from the 1280x720 canvas). */
+  totalSlots: number;
+  tiles: MosaicTile[]; // ready sources only
   width: number;
   height: number;
-  /** Negotiated bitrate in kbps (0 = leave the encoder unconstrained). */
-  maxBitrateKbps: number;
+  fps: number;
+  maxBitrateKbps: number; // 0 = unconstrained
   video: RtpTarget & { mtu: number };
 };
 
 export function buildMosaicArgs(o: MosaicArgsOptions): string[] {
-  const n = o.sourceUrls.length;
-  const plan = planMosaic(n);
-  const scaled = o.width !== MOSAIC_CANVAS_W || o.height !== MOSAIC_CANVAS_H;
+  const geo = mosaicGeometry(o.totalSlots, o.width, o.height);
+  const filter = buildMosaicFilter(o.tiles, geo);
 
-  // Compose the grid, then (if needed) scale the whole canvas to the
-  // negotiated output size.
-  const filter = scaled
-    ? `${buildMosaicFilter(n, plan, "m")};[m]scale=${o.width}:${o.height}[v]`
-    : buildMosaicFilter(n, plan, "v");
-
-  const args = ["-hide_banner", "-loglevel", "error"];
-  for (const url of o.sourceUrls) {
-    args.push("-rtsp_transport", "tcp", "-i", url);
+  const args = [
+    "-hide_banner", "-loglevel", "error",
+    "-f", "lavfi", "-i", `color=c=${LOADING_BG}:s=${o.width}x${o.height}:r=${o.fps}`,
+  ];
+  for (const tile of o.tiles) {
+    args.push("-rtsp_transport", "tcp", "-i", tile.url);
+  }
+  if (filter) {
+    args.push("-filter_complex", filter, "-map", "[v]");
+  } else {
+    args.push("-map", "0:v");
   }
   args.push(
-    "-filter_complex", filter,
-    "-map", "[v]",
     "-an",
     "-c:v", "libx264",
     "-preset", "ultrafast",
@@ -113,20 +113,25 @@ export function buildMosaicArgs(o: MosaicArgsOptions): string[] {
   return args;
 }
 
-/** Snapshot argv: composite at canvas size, one frame to stdout as JPEG. */
-export function buildMosaicSnapshotArgs(sourceUrls: string[]): string[] {
-  const n = sourceUrls.length;
-  const plan = planMosaic(n);
-  const args = ["-hide_banner", "-loglevel", "error"];
-  for (const url of sourceUrls) {
-    args.push("-rtsp_transport", "tcp", "-i", url);
+/** Snapshot: composite the base + ready tiles, one frame to stdout. Always
+ *  produces something instantly (base) even if no tile is ready. */
+export function buildMosaicSnapshotArgs(
+  totalSlots: number,
+  tiles: MosaicTile[],
+  width = 1280,
+  height = 720
+): string[] {
+  const geo = mosaicGeometry(totalSlots, width, height);
+  const filter = buildMosaicFilter(tiles, geo);
+  const args = [
+    "-hide_banner", "-loglevel", "error",
+    "-f", "lavfi", "-i", `color=c=${LOADING_BG}:s=${width}x${height}`,
+  ];
+  for (const tile of tiles) {
+    args.push("-rtsp_transport", "tcp", "-i", tile.url);
   }
-  args.push(
-    "-filter_complex", buildMosaicFilter(n, plan, "v"),
-    "-map", "[v]",
-    "-frames:v", "1",
-    "-f", "image2",
-    "-"
-  );
+  if (filter) args.push("-filter_complex", filter, "-map", "[v]");
+  else args.push("-map", "0:v");
+  args.push("-frames:v", "1", "-f", "image2", "-");
   return args;
 }

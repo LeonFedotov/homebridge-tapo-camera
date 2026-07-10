@@ -96,8 +96,6 @@ export class Go2rtcManager implements SourceProvider {
   ) {}
 
   private readonly kinds = new Map<string, "rtsp" | "exec">();
-  private readonly execIds: string[] = [];
-  private keepaliveAbort: AbortController | null = null;
 
   registerCamera(config: CameraSourceConfig): void {
     if (!/^[A-Za-z0-9-]+$/.test(config.id)) {
@@ -105,41 +103,6 @@ export class Go2rtcManager implements SourceProvider {
     }
     this.cameras.push(config);
     this.kinds.set(config.id, config.kind);
-    if (config.kind === "exec") this.execIds.push(config.id);
-  }
-
-  // exec sources (HTML cameras) cold-start their capture only when first
-  // consumed — several seconds — which blows past HomeKit's ~4s stream-start
-  // patience and, worse, stalls a mosaic's xstack (it waits for every input).
-  // Hold a cheap persistent consumer on each so go2rtc keeps them hot; the
-  // mosaic and standalone HTML cameras then open instantly. Discards the
-  // stream body, so the only real cost is the (low-motion) capture encode.
-  private startKeepalive(): void {
-    if (this.execIds.length === 0) return;
-    this.keepaliveAbort = new AbortController();
-    this.log.info(`Keeping ${this.execIds.length} HTML source(s) warm`);
-    for (const id of this.execIds) void this.keepWarm(id);
-  }
-
-  private async keepWarm(id: string): Promise<void> {
-    while (!this.stopped) {
-      try {
-        const res = await fetch(
-          `http://127.0.0.1:${this.apiPort}/api/stream.mp4?src=${id}`,
-          { signal: this.keepaliveAbort?.signal }
-        );
-        const reader = res.body?.getReader();
-        if (!reader) throw new Error("no stream body");
-        for (;;) {
-          const { done } = await reader.read();
-          if (done) break;
-        }
-      } catch (err) {
-        if (this.stopped || (err as Error).name === "AbortError") return;
-        this.log.debug(`keepalive ${id} reconnecting: ${(err as Error).message}`);
-      }
-      await new Promise((r) => setTimeout(r, 2000));
-    }
   }
 
   private resolveBinary(): string {
@@ -188,8 +151,6 @@ export class Go2rtcManager implements SourceProvider {
       void this.healthCheck();
     }, HEALTH_POLL_MS);
     this.healthTimer.unref();
-
-    this.startKeepalive();
   }
 
   private spawnChild(binary: string): void {
@@ -304,11 +265,6 @@ export class Go2rtcManager implements SourceProvider {
   stop(): void {
     this.stopped = true;
     this.ready = false;
-    try {
-      this.keepaliveAbort?.abort();
-    } catch {
-      /* nothing bound */
-    }
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;

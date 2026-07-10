@@ -16,20 +16,17 @@ import type {
   StreamingRequest,
   StreamRequestCallback,
 } from "homebridge";
-import {
-  buildMosaicArgs,
-  buildMosaicSnapshotArgs,
-  MOSAIC_CANVAS_H,
-  MOSAIC_CANVAS_W,
-} from "./mosaic";
+import { buildMosaicArgs, buildMosaicSnapshotArgs, MosaicTile } from "./mosaic";
 import { SourceProvider } from "./sourceProvider";
-import { shouldApplyReconfigure } from "./tierPolicy";
 
-const RESPAWN_MAX = 5;
-const RESPAWN_DELAY_MS = 3_000;
-const RESPAWN_RESET_MS = 60_000;
-const SNAPSHOT_CACHE_MS = 5_000;
-const SNAPSHOT_TIMEOUT_MS = 12_000;
+// A glance view: smooth and cheap beats sharp. Cap fps low.
+const MOSAIC_MAX_FPS = 10;
+const CANVAS_W = 1280;
+const CANVAS_H = 720;
+const RESPAWN_DEBOUNCE_MS = 600;
+const SNAPSHOT_CACHE_MS = 10_000;
+const SNAPSHOT_TIMEOUT_MS = 6_000;
+const READY_TTL_MS = 30_000;
 
 type SessionInfo = {
   address: string;
@@ -43,53 +40,33 @@ type ActiveSession = {
   info: SessionInfo;
   ffmpeg: ChildProcess | null;
   timeout: NodeJS.Timeout | null;
+  respawnTimer: NodeJS.Timeout | null;
   videoPt: number;
   mtu: number;
   fps: number;
   width: number;
   height: number;
   maxBitrateKbps: number;
-  lastChangeAt: number;
-  respawns: number;
+  readySlots: Set<number>;
 };
-
-/** Clamp a HomeKit-negotiated video request to the mosaic canvas. */
-function negotiate(video: {
-  width?: number;
-  height?: number;
-  fps?: number;
-  max_bit_rate?: number;
-}): { width: number; height: number; fps: number; maxBitrateKbps: number } {
-  const even = (n: number) => Math.max(2, Math.floor(n / 2) * 2);
-  return {
-    width: even(Math.min(video.width || MOSAIC_CANVAS_W, MOSAIC_CANVAS_W)),
-    height: even(Math.min(video.height || MOSAIC_CANVAS_H, MOSAIC_CANVAS_H)),
-    fps: Math.min(video.fps || 15, 15),
-    maxBitrateKbps: video.max_bit_rate || 0,
-  };
-}
 
 export type MosaicDelegateOptions = {
   name: string;
   provider: SourceProvider;
-  /** Member camera ids; their sub-tier relay streams are composited. */
   memberIds: string[];
 };
 
-/**
- * A synthetic camera that composites the sub-tier streams of every real
- * camera into one grid. Reuses the same session lifecycle as the per-camera
- * delegate (held return sockets, payload_type, respawn-on-death, idle
- * timeout) but with a fixed 720p output, no audio, and no tier/reconfigure
- * logic — the mosaic is a single fixed-quality glance view.
- */
 export class MosaicStreamingDelegate implements CameraStreamingDelegate {
   public readonly controller: CameraController;
   private readonly ffmpegPath: string;
+  private readonly totalSlots: number;
   private readonly pendingSessions = new Map<string, SessionInfo>();
   private readonly ongoingSessions = new Map<string, ActiveSession>();
   private stopped = false;
-  private lastSnapshot: { data: Buffer; takenAt: number } | null = null;
+
+  // Members known to be producing recently — reused for cheap snapshots.
+  private knownReady = new Map<number, number>(); // slot → last-ready timestamp(ms)
+  private snapshotCache: { data: Buffer; takenAt: number } | null = null;
 
   constructor(
     private readonly log: Logging,
@@ -97,6 +74,7 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
     private readonly opts: MosaicDelegateOptions
   ) {
     this.ffmpegPath = ffmpegForHomebridge || "ffmpeg";
+    this.totalSlots = opts.memberIds.length;
 
     const options: CameraControllerOptions = {
       cameraStreamCount: 2,
@@ -105,10 +83,10 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
         supportedCryptoSuites: [hap.SRTPCryptoSuites.AES_CM_128_HMAC_SHA1_80],
         video: {
           resolutions: [
-            [320, 180, 15],
-            [480, 270, 15],
-            [640, 360, 15],
-            [1280, 720, 15],
+            [320, 180, MOSAIC_MAX_FPS],
+            [480, 270, MOSAIC_MAX_FPS],
+            [640, 360, MOSAIC_MAX_FPS],
+            [1280, 720, MOSAIC_MAX_FPS],
           ],
           codec: {
             profiles: [hap.H264Profile.BASELINE, hap.H264Profile.MAIN, hap.H264Profile.HIGH],
@@ -121,17 +99,19 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
     this.controller = new hap.CameraController(options);
   }
 
-  private sourceUrls(): string[] {
-    return this.opts.memberIds.map((id) =>
-      this.opts.provider.getSourceUrl(id, "sub")
-    );
+  private tilesFor(slots: Set<number>): MosaicTile[] {
+    const tiles: MosaicTile[] = [];
+    for (let slot = 0; slot < this.totalSlots; slot++) {
+      if (slots.has(slot)) {
+        tiles.push({ slot, url: this.opts.provider.getSourceUrl(this.opts.memberIds[slot], "sub") });
+      }
+    }
+    return tiles;
   }
 
-  handleSnapshotRequest(
-    _request: SnapshotRequest,
-    callback: SnapshotRequestCallback
-  ): void {
-    const cached = this.lastSnapshot;
+  // ---- snapshots (cheap: base + last-known-ready tiles, cached, bounded) ----
+  handleSnapshotRequest(_request: SnapshotRequest, callback: SnapshotRequestCallback): void {
+    const cached = this.snapshotCache;
     if (cached && Date.now() - cached.takenAt < SNAPSHOT_CACHE_MS) {
       callback(undefined, cached.data);
       return;
@@ -141,16 +121,25 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
       return;
     }
 
-    const ffmpeg = spawn(this.ffmpegPath, buildMosaicSnapshotArgs(this.sourceUrls()));
+    const now = Date.now();
+    const ready = new Set<number>();
+    for (const [slot, ts] of this.knownReady) {
+      if (now - ts < READY_TTL_MS) ready.add(slot);
+    }
+    void this.refreshReadiness(); // warm for next time, non-blocking
+
+    const ffmpeg = spawn(
+      this.ffmpegPath,
+      buildMosaicSnapshotArgs(this.totalSlots, this.tilesFor(ready), CANVAS_W, CANVAS_H)
+    );
     const chunks: Buffer[] = [];
-    let stderr = "";
     let done = false;
     const finish = (err?: Error, data?: Buffer) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       if (data && data.length > 0) {
-        this.lastSnapshot = { data, takenAt: Date.now() };
+        this.snapshotCache = { data, takenAt: Date.now() };
         callback(undefined, data);
       } else {
         callback(err ?? new Error("Mosaic snapshot produced no image"));
@@ -164,25 +153,29 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
       }
       finish(new Error("Mosaic snapshot timed out"));
     }, SNAPSHOT_TIMEOUT_MS);
-
     ffmpeg.stdout?.on("data", (d: Buffer) => chunks.push(d));
-    ffmpeg.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
+    ffmpeg.stderr?.on("data", (d: Buffer) => this.log.debug(`[${this.opts.name}] snap: ${d.toString().trim()}`));
     ffmpeg.on("error", (err) => finish(err));
-    ffmpeg.on("close", () => {
-      if (chunks.length === 0) {
-        this.log.warn(`[${this.opts.name}] snapshot failed: ${stderr.trim().slice(-200)}`);
-      }
-      finish(undefined, Buffer.concat(chunks));
-    });
+    ffmpeg.on("close", () => finish(undefined, Buffer.concat(chunks)));
   }
 
-  async prepareStream(
-    request: PrepareStreamRequest,
-    callback: PrepareStreamCallback
-  ): Promise<void> {
-    const videoReturnSocket = createSocket(
-      request.addressVersion === "ipv6" ? "udp6" : "udp4"
+  // Probe each member (also warms it); mark ready ones. Bounded, best-effort.
+  private async refreshReadiness(onReady?: (slot: number) => void): Promise<void> {
+    await Promise.allSettled(
+      this.opts.memberIds.map(async (id, slot) => {
+        try {
+          await this.opts.provider.getFrame(id);
+          this.knownReady.set(slot, Date.now());
+          onReady?.(slot);
+        } catch {
+          /* not ready / dead — stays a loading tile */
+        }
+      })
     );
+  }
+
+  async prepareStream(request: PrepareStreamRequest, callback: PrepareStreamCallback): Promise<void> {
+    const videoReturnSocket = createSocket(request.addressVersion === "ipv6" ? "udp6" : "udp4");
     try {
       const videoReturnPort = await new Promise<number>((resolve, reject) => {
         videoReturnSocket.once("error", reject);
@@ -194,7 +187,6 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
       const audioReturnPort = await this.pickPort();
       const videoSSRC = this.hap.CameraController.generateSynchronisationSource();
       const audioSSRC = this.hap.CameraController.generateSynchronisationSource();
-
       this.pendingSessions.set(request.sessionID, {
         address: request.targetAddress,
         videoPort: request.video.port,
@@ -202,8 +194,7 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
         videoSRTP: Buffer.concat([request.video.srtp_key, request.video.srtp_salt]),
         videoSSRC,
       });
-
-      const response: PrepareStreamResponse = {
+      callback(undefined, {
         video: {
           port: videoReturnPort,
           ssrc: videoSSRC,
@@ -216,8 +207,7 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
           srtp_key: request.audio.srtp_key,
           srtp_salt: request.audio.srtp_salt,
         },
-      };
-      callback(undefined, response);
+      } as PrepareStreamResponse);
     } catch (err) {
       try {
         videoReturnSocket.close();
@@ -228,62 +218,44 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
     }
   }
 
-  handleStreamRequest(
-    request: StreamingRequest,
-    callback: StreamRequestCallback
-  ): void {
+  handleStreamRequest(request: StreamingRequest, callback: StreamRequestCallback): void {
     switch (request.type) {
       case this.hap.StreamRequestTypes.START:
         this.startStream(request, callback);
         break;
       case this.hap.StreamRequestTypes.RECONFIGURE: {
         const session = this.ongoingSessions.get(request.sessionID);
-        if (!session) {
-          callback();
-          break;
+        if (session) {
+          const neg = this.negotiate(request.video);
+          if (neg.width !== session.width || neg.height !== session.height || neg.maxBitrateKbps !== session.maxBitrateKbps) {
+            session.width = neg.width;
+            session.height = neg.height;
+            session.fps = neg.fps;
+            session.maxBitrateKbps = neg.maxBitrateKbps;
+            this.respawn(request.sessionID, session);
+          }
         }
-        const n = negotiate(request.video);
-        const prev = {
-          source: "sub" as const, mode: "encode" as const,
-          width: session.width, height: session.height, fps: session.fps,
-          bitrateKbps: session.maxBitrateKbps,
-        };
-        const next = { ...prev, width: n.width, height: n.height, fps: n.fps, bitrateKbps: n.maxBitrateKbps };
-        if (!shouldApplyReconfigure(prev, next, Date.now() - session.lastChangeAt)) {
-          callback();
-          break;
-        }
-        session.width = n.width;
-        session.height = n.height;
-        session.fps = n.fps;
-        session.maxBitrateKbps = n.maxBitrateKbps;
-        session.lastChangeAt = Date.now();
-        this.log.info(
-          `[${this.opts.name}] Reconfiguring mosaic: ${n.width}x${n.height}@${n.fps} ${n.maxBitrateKbps}kbps`
-        );
-        const old = session.ffmpeg;
-        session.ffmpeg = null;
-        try {
-          old?.kill("SIGKILL");
-        } catch {
-          /* gone */
-        }
-        this.spawnFfmpeg(request.sessionID, session);
         callback();
         break;
       }
       case this.hap.StreamRequestTypes.STOP:
-        this.log.info(`[${this.opts.name}] client requested STOP`);
         this.stopStream(request.sessionID);
         callback();
         break;
     }
   }
 
-  private startStream(
-    request: StartStreamRequest,
-    callback: StreamRequestCallback
-  ): void {
+  private negotiate(video: { width?: number; height?: number; fps?: number; max_bit_rate?: number }) {
+    const even = (n: number) => Math.max(2, Math.floor(n / 2) * 2);
+    return {
+      width: even(Math.min(video.width || CANVAS_W, CANVAS_W)),
+      height: even(Math.min(video.height || CANVAS_H, CANVAS_H)),
+      fps: Math.min(video.fps || MOSAIC_MAX_FPS, MOSAIC_MAX_FPS),
+      maxBitrateKbps: video.max_bit_rate || 0,
+    };
+  }
+
+  private startStream(request: StartStreamRequest, callback: StreamRequestCallback): void {
     const info = this.pendingSessions.get(request.sessionID);
     if (!info) {
       callback(new Error("Session not found"));
@@ -293,38 +265,41 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
       try {
         info.videoReturnSocket.close();
       } catch {
-        /* already closed */
+        /* closed */
       }
       this.pendingSessions.delete(request.sessionID);
       callback(new Error("Video source not ready"));
       return;
     }
 
-    const n = negotiate(request.video);
+    const neg = this.negotiate(request.video);
+    // Seed from recently-known-ready members so warm tiles show at once.
+    const now = Date.now();
+    const seeded = new Set<number>();
+    for (const [slot, ts] of this.knownReady) if (now - ts < READY_TTL_MS) seeded.add(slot);
+
     const session: ActiveSession = {
       info,
       ffmpeg: null,
       timeout: null,
+      respawnTimer: null,
       videoPt: request.video.pt,
       mtu: request.video.mtu || 1316,
-      fps: n.fps,
-      width: n.width,
-      height: n.height,
-      maxBitrateKbps: n.maxBitrateKbps,
-      lastChangeAt: Date.now(),
-      respawns: 0,
+      fps: neg.fps,
+      width: neg.width,
+      height: neg.height,
+      maxBitrateKbps: neg.maxBitrateKbps,
+      readySlots: seeded,
     };
 
     this.log.info(
-      `[${this.opts.name}] Starting mosaic: ${this.opts.memberIds.length} cameras, ` +
-        `${session.width}x${session.height}@${session.fps} ${session.maxBitrateKbps}kbps, pt=${session.videoPt}`
+      `[${this.opts.name}] Starting mosaic: ${this.totalSlots} tiles, ${session.width}x${session.height}@${session.fps} ${session.maxBitrateKbps}kbps, pt=${session.videoPt}`
     );
 
     const armIdleTimeout = () => {
       if (session.timeout) clearTimeout(session.timeout);
       const timeout = Math.max(30_000, request.video.rtcp_interval * 5 * 1000);
       session.timeout = setTimeout(() => {
-        this.log.info(`[${this.opts.name}] Mosaic idle timeout. Stopping.`);
         this.controller.forceStopStreamingSession(request.sessionID);
         this.stopStream(request.sessionID);
       }, timeout);
@@ -338,19 +313,42 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
 
     this.ongoingSessions.set(request.sessionID, session);
     this.pendingSessions.delete(request.sessionID);
+
+    // Stream the base (loading tiles + any warm tiles) immediately, then fill
+    // in the rest as each member reports ready.
     this.spawnFfmpeg(request.sessionID, session, callback);
+    void this.refreshReadiness((slot) => {
+      if (this.stopped || !this.ongoingSessions.has(request.sessionID)) return;
+      if (session.readySlots.has(slot)) return;
+      session.readySlots.add(slot);
+      if (session.respawnTimer) clearTimeout(session.respawnTimer);
+      session.respawnTimer = setTimeout(() => {
+        session.respawnTimer = null;
+        this.respawn(request.sessionID, session);
+      }, RESPAWN_DEBOUNCE_MS);
+    });
   }
 
-  private spawnFfmpeg(
-    sessionId: string,
-    session: ActiveSession,
-    startCallback?: StreamRequestCallback
-  ): void {
+  private respawn(sessionId: string, session: ActiveSession): void {
+    if (this.stopped || this.ongoingSessions.get(sessionId) !== session) return;
+    const old = session.ffmpeg;
+    session.ffmpeg = null;
+    try {
+      old?.kill("SIGKILL");
+    } catch {
+      /* gone */
+    }
+    this.spawnFfmpeg(sessionId, session);
+  }
+
+  private spawnFfmpeg(sessionId: string, session: ActiveSession, startCallback?: StreamRequestCallback): void {
+    const tiles = this.tilesFor(session.readySlots);
     const args = buildMosaicArgs({
-      sourceUrls: this.sourceUrls(),
-      fps: session.fps,
+      totalSlots: this.totalSlots,
+      tiles,
       width: session.width,
       height: session.height,
+      fps: session.fps,
       maxBitrateKbps: session.maxBitrateKbps,
       video: {
         address: session.info.address,
@@ -361,15 +359,11 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
         mtu: session.mtu,
       },
     });
-    this.log.debug(`ffmpeg ${args.join(" ")}`);
+    this.log.debug(`[${this.opts.name}] mosaic ${tiles.length}/${this.totalSlots} tiles ready`);
 
     const ffmpeg = spawn(this.ffmpegPath, args);
     session.ffmpeg = ffmpeg;
     let started = false;
-
-    setTimeout(() => {
-      if (session.ffmpeg === ffmpeg) session.respawns = 0;
-    }, RESPAWN_RESET_MS).unref();
 
     ffmpeg.stderr?.on("data", (d: Buffer) => this.log.debug(d.toString().trim()));
     ffmpeg.on("error", (err) => {
@@ -382,26 +376,12 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
       this.stopStream(sessionId);
     });
     ffmpeg.on("exit", (code) => {
-      if (session.ffmpeg !== ffmpeg) return;
+      if (session.ffmpeg !== ffmpeg) return; // replaced by a respawn — ignore
       if (code === 0 || code === null) return;
       if (this.stopped || !this.ongoingSessions.has(sessionId)) return;
-      if (session.respawns >= RESPAWN_MAX) {
-        this.log.warn(`[${this.opts.name}] mosaic ffmpeg kept dying (code=${code}), giving up`);
-        this.controller.forceStopStreamingSession(sessionId);
-        this.stopStream(sessionId);
-        return;
-      }
-      session.respawns++;
-      this.log.warn(
-        `[${this.opts.name}] mosaic ffmpeg exited (code=${code}), ` +
-          `respawn ${session.respawns}/${RESPAWN_MAX} in ${RESPAWN_DELAY_MS / 1000}s ` +
-          `(a member camera may be offline)`
-      );
-      setTimeout(() => {
-        if (!this.stopped && session.ffmpeg === ffmpeg && this.ongoingSessions.has(sessionId)) {
-          this.spawnFfmpeg(sessionId, session);
-        }
-      }, RESPAWN_DELAY_MS).unref();
+      this.log.warn(`[${this.opts.name}] mosaic ffmpeg exited (code=${code})`);
+      this.controller.forceStopStreamingSession(sessionId);
+      this.stopStream(sessionId);
     });
 
     if (startCallback && !started) {
@@ -416,7 +396,7 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
       try {
         pending.videoReturnSocket.close();
       } catch {
-        /* already closed */
+        /* closed */
       }
       this.pendingSessions.delete(sessionId);
     }
@@ -424,10 +404,11 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
     if (!session) return;
     this.ongoingSessions.delete(sessionId);
     if (session.timeout) clearTimeout(session.timeout);
+    if (session.respawnTimer) clearTimeout(session.respawnTimer);
     try {
       session.info.videoReturnSocket.close();
     } catch {
-      /* already closed */
+      /* closed */
     }
     const ffmpeg = session.ffmpeg;
     session.ffmpeg = null;
@@ -458,14 +439,12 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
 
   shutdown(): void {
     this.stopped = true;
-    for (const id of [...this.ongoingSessions.keys()]) {
-      this.stopStream(id, true);
-    }
+    for (const id of [...this.ongoingSessions.keys()]) this.stopStream(id, true);
     for (const [id, info] of this.pendingSessions) {
       try {
         info.videoReturnSocket.close();
       } catch {
-        /* already closed */
+        /* closed */
       }
       this.pendingSessions.delete(id);
     }

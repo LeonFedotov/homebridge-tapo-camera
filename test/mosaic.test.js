@@ -4,26 +4,10 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
-  planMosaic,
-  buildMosaicFilter,
+  mosaicGeometry,
   buildMosaicArgs,
   buildMosaicSnapshotArgs,
 } = require("../dist/streaming/mosaic");
-
-test("grid plan scales square-ish and tiles fit the 1280x720 canvas", () => {
-  assert.deepEqual(planMosaic(2), { cols: 2, rows: 1, tileW: 640, tileH: 720 });
-  assert.deepEqual(planMosaic(3), { cols: 2, rows: 2, tileW: 640, tileH: 360 });
-  assert.deepEqual(planMosaic(4), { cols: 2, rows: 2, tileW: 640, tileH: 360 });
-  assert.deepEqual(planMosaic(9), { cols: 3, rows: 3, tileW: 426, tileH: 240 });
-});
-
-test("filter letterboxes each input and lays out a black-filled grid", () => {
-  const f = buildMosaicFilter(4, planMosaic(4));
-  // one scale+pad per input
-  assert.equal((f.match(/force_original_aspect_ratio=decrease/g) || []).length, 4);
-  // 2x2 layout positions
-  assert.match(f, /xstack=inputs=4:layout=0_0\|640_0\|0_360\|640_360:fill=black\[v\]/);
-});
 
 const target = {
   address: "192.168.1.5",
@@ -33,63 +17,62 @@ const target = {
   srtpParams: "a2V5",
   mtu: 1378,
 };
+const url = (n) => `rtsp://127.0.0.1:8554/${n}_sub`;
 
-test("mosaic at full canvas + capped bitrate: no scale filter, bitrate flags present", () => {
-  const args = buildMosaicArgs({
-    sourceUrls: ["rtsp://127.0.0.1:8554/a_sub", "rtsp://127.0.0.1:8554/b_sub"],
-    fps: 15,
-    width: 1280,
-    height: 720,
-    maxBitrateKbps: 802,
-    video: target,
-  });
-  assert.equal(args.filter((a) => a === "-i").length, 2);
-  assert.equal(args.includes("-an"), true);
-  assert.equal(args[args.indexOf("-payload_type") + 1], "99");
-  assert.equal(args[args.indexOf("-g") + 1], "30");
-  assert.equal(args[args.indexOf("-b:v") + 1], "802k");
-  assert.equal(args[args.indexOf("-bufsize") + 1], "1604k");
-  // full canvas → the filter maps xstack straight to [v], no scale
-  const vf = args[args.indexOf("-filter_complex") + 1];
-  assert.match(vf, /xstack=inputs=2:.*\[v\]$/);
-  assert.equal(vf.includes("scale=1280:720"), false);
-  assert.match(args[args.length - 1], /^srtp:\/\/.*pkt_size=1378$/);
+test("geometry: square-ish grid, tiles fit the output size", () => {
+  assert.deepEqual(mosaicGeometry(2, 1280, 720), { cols: 2, rows: 1, tileW: 640, tileH: 720 });
+  assert.deepEqual(mosaicGeometry(3, 1280, 720), { cols: 2, rows: 2, tileW: 640, tileH: 360 });
+  assert.deepEqual(mosaicGeometry(4, 640, 360), { cols: 2, rows: 2, tileW: 320, tileH: 180 });
 });
 
-test("mosaic honors the negotiated resolution (scales the canvas down)", () => {
+test("no ready tiles: streams the loading base alone (instant start, no blocking inputs)", () => {
   const args = buildMosaicArgs({
-    sourceUrls: ["rtsp://127.0.0.1:8554/a_sub", "rtsp://127.0.0.1:8554/b_sub"],
-    fps: 15,
+    totalSlots: 3,
+    tiles: [],
     width: 640,
     height: 360,
+    fps: 10,
     maxBitrateKbps: 299,
     video: target,
   });
-  const vf = args[args.indexOf("-filter_complex") + 1];
-  assert.match(vf, /\[m\];\[m\]scale=640:360\[v\]$/);
+  // only the lavfi base input, mapped directly — no camera inputs to stall on
+  assert.equal(args.filter((a) => a === "-i").length, 1);
+  assert.match(args[args.indexOf("-i") + 1], /^color=c=.*:s=640x360:r=10$/);
+  assert.equal(args[args.indexOf("-map") + 1], "0:v");
+  assert.equal(args.includes("-filter_complex"), false);
   assert.equal(args[args.indexOf("-maxrate") + 1], "299k");
+  assert.match(args[args.length - 1], /^srtp:\/\//);
 });
 
-test("mosaic with unknown bitrate: no bitrate flags", () => {
+test("partial tiles: only ready sources are inputs; each overlaid at its slot", () => {
   const args = buildMosaicArgs({
-    sourceUrls: ["rtsp://127.0.0.1:8554/a_sub", "rtsp://127.0.0.1:8554/b_sub"],
-    fps: 15,
+    totalSlots: 3,
+    tiles: [
+      { slot: 0, url: url("home") },
+      { slot: 2, url: url("dash") },
+    ],
     width: 1280,
     height: 720,
+    fps: 10,
     maxBitrateKbps: 0,
     video: target,
   });
-  assert.equal(args.includes("-b:v"), false);
-  assert.equal(args.includes("-maxrate"), false);
+  // base + exactly the 2 ready inputs (the cold slot 1 is NOT referenced)
+  assert.equal(args.filter((a) => a === "-i").length, 3);
+  const vf = args[args.indexOf("-filter_complex") + 1];
+  // slot 0 at (0,0), slot 2 at (0,360) on a 2x2 grid of 640x360 tiles
+  assert.match(vf, /overlay=0:0:eof_action=pass/);
+  assert.match(vf, /overlay=0:360:eof_action=pass/);
+  assert.equal(args[args.indexOf("-map") + 1], "[v]");
+  assert.equal(args.includes("-b:v"), false); // uncapped
 });
 
-test("snapshot args composite one frame to stdout", () => {
-  const args = buildMosaicSnapshotArgs([
-    "rtsp://127.0.0.1:8554/a_sub",
-    "rtsp://127.0.0.1:8554/b_sub",
-    "rtsp://127.0.0.1:8554/c_sub",
-  ]);
-  assert.equal(args.filter((a) => a === "-i").length, 3);
-  assert.equal(args[args.indexOf("-frames:v") + 1], "1");
-  assert.deepEqual(args.slice(-3), ["-f", "image2", "-"]);
+test("snapshot: base + ready tiles, one frame to stdout, never needs a camera input", () => {
+  const empty = buildMosaicSnapshotArgs(3, []);
+  assert.equal(empty.filter((a) => a === "-i").length, 1);
+  assert.equal(empty[empty.length - 1], "-");
+  assert.equal(empty[empty.indexOf("-frames:v") + 1], "1");
+
+  const one = buildMosaicSnapshotArgs(3, [{ slot: 1, url: url("home") }]);
+  assert.equal(one.filter((a) => a === "-i").length, 2);
 });
