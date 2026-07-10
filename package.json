@@ -11,6 +11,7 @@
     "build": "rimraf ./dist && tsc",
     "test": "npm run build && node --test",
     "test:integration": "node test/integration-fake-camera.mjs",
+    "prepare": "npm run build",
     "postinstall": "node scripts/download-go2rtc.mjs",
     "prepublishOnly": "npm run lint && npm run build"
   },
