@@ -25,27 +25,62 @@ test("filter letterboxes each input and lays out a black-filled grid", () => {
   assert.match(f, /xstack=inputs=4:layout=0_0\|640_0\|0_360\|640_360:fill=black\[v\]/);
 });
 
-test("mosaic args: N rtsp inputs, single SRTP video output, no audio, url terminal", () => {
+const target = {
+  address: "192.168.1.5",
+  port: 50000,
+  payloadType: 99,
+  ssrc: 42,
+  srtpParams: "a2V5",
+  mtu: 1378,
+};
+
+test("mosaic at full canvas + capped bitrate: no scale filter, bitrate flags present", () => {
   const args = buildMosaicArgs({
-    sourceUrls: [
-      "rtsp://127.0.0.1:8554/a_sub",
-      "rtsp://127.0.0.1:8554/b_sub",
-    ],
+    sourceUrls: ["rtsp://127.0.0.1:8554/a_sub", "rtsp://127.0.0.1:8554/b_sub"],
     fps: 15,
-    video: {
-      address: "192.168.1.5",
-      port: 50000,
-      payloadType: 99,
-      ssrc: 42,
-      srtpParams: "a2V5",
-      mtu: 1378,
-    },
+    width: 1280,
+    height: 720,
+    maxBitrateKbps: 802,
+    video: target,
   });
   assert.equal(args.filter((a) => a === "-i").length, 2);
   assert.equal(args.includes("-an"), true);
   assert.equal(args[args.indexOf("-payload_type") + 1], "99");
   assert.equal(args[args.indexOf("-g") + 1], "30");
+  assert.equal(args[args.indexOf("-b:v") + 1], "802k");
+  assert.equal(args[args.indexOf("-bufsize") + 1], "1604k");
+  // full canvas → the filter maps xstack straight to [v], no scale
+  const vf = args[args.indexOf("-filter_complex") + 1];
+  assert.match(vf, /xstack=inputs=2:.*\[v\]$/);
+  assert.equal(vf.includes("scale=1280:720"), false);
   assert.match(args[args.length - 1], /^srtp:\/\/.*pkt_size=1378$/);
+});
+
+test("mosaic honors the negotiated resolution (scales the canvas down)", () => {
+  const args = buildMosaicArgs({
+    sourceUrls: ["rtsp://127.0.0.1:8554/a_sub", "rtsp://127.0.0.1:8554/b_sub"],
+    fps: 15,
+    width: 640,
+    height: 360,
+    maxBitrateKbps: 299,
+    video: target,
+  });
+  const vf = args[args.indexOf("-filter_complex") + 1];
+  assert.match(vf, /\[m\];\[m\]scale=640:360\[v\]$/);
+  assert.equal(args[args.indexOf("-maxrate") + 1], "299k");
+});
+
+test("mosaic with unknown bitrate: no bitrate flags", () => {
+  const args = buildMosaicArgs({
+    sourceUrls: ["rtsp://127.0.0.1:8554/a_sub", "rtsp://127.0.0.1:8554/b_sub"],
+    fps: 15,
+    width: 1280,
+    height: 720,
+    maxBitrateKbps: 0,
+    video: target,
+  });
+  assert.equal(args.includes("-b:v"), false);
+  assert.equal(args.includes("-maxrate"), false);
 });
 
 test("snapshot args composite one frame to stdout", () => {

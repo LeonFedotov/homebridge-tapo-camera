@@ -16,8 +16,14 @@ import type {
   StreamingRequest,
   StreamRequestCallback,
 } from "homebridge";
-import { buildMosaicArgs, buildMosaicSnapshotArgs } from "./mosaic";
+import {
+  buildMosaicArgs,
+  buildMosaicSnapshotArgs,
+  MOSAIC_CANVAS_H,
+  MOSAIC_CANVAS_W,
+} from "./mosaic";
 import { SourceProvider } from "./sourceProvider";
+import { shouldApplyReconfigure } from "./tierPolicy";
 
 const RESPAWN_MAX = 5;
 const RESPAWN_DELAY_MS = 3_000;
@@ -40,8 +46,28 @@ type ActiveSession = {
   videoPt: number;
   mtu: number;
   fps: number;
+  width: number;
+  height: number;
+  maxBitrateKbps: number;
+  lastChangeAt: number;
   respawns: number;
 };
+
+/** Clamp a HomeKit-negotiated video request to the mosaic canvas. */
+function negotiate(video: {
+  width?: number;
+  height?: number;
+  fps?: number;
+  max_bit_rate?: number;
+}): { width: number; height: number; fps: number; maxBitrateKbps: number } {
+  const even = (n: number) => Math.max(2, Math.floor(n / 2) * 2);
+  return {
+    width: even(Math.min(video.width || MOSAIC_CANVAS_W, MOSAIC_CANVAS_W)),
+    height: even(Math.min(video.height || MOSAIC_CANVAS_H, MOSAIC_CANVAS_H)),
+    fps: Math.min(video.fps || 15, 15),
+    maxBitrateKbps: video.max_bit_rate || 0,
+  };
+}
 
 export type MosaicDelegateOptions = {
   name: string;
@@ -210,10 +236,42 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
       case this.hap.StreamRequestTypes.START:
         this.startStream(request, callback);
         break;
-      case this.hap.StreamRequestTypes.RECONFIGURE:
-        // Fixed-quality glance view: nothing to reconfigure.
+      case this.hap.StreamRequestTypes.RECONFIGURE: {
+        const session = this.ongoingSessions.get(request.sessionID);
+        if (!session) {
+          callback();
+          break;
+        }
+        const n = negotiate(request.video);
+        const prev = {
+          source: "sub" as const, mode: "encode" as const,
+          width: session.width, height: session.height, fps: session.fps,
+          bitrateKbps: session.maxBitrateKbps,
+        };
+        const next = { ...prev, width: n.width, height: n.height, fps: n.fps, bitrateKbps: n.maxBitrateKbps };
+        if (!shouldApplyReconfigure(prev, next, Date.now() - session.lastChangeAt)) {
+          callback();
+          break;
+        }
+        session.width = n.width;
+        session.height = n.height;
+        session.fps = n.fps;
+        session.maxBitrateKbps = n.maxBitrateKbps;
+        session.lastChangeAt = Date.now();
+        this.log.info(
+          `[${this.opts.name}] Reconfiguring mosaic: ${n.width}x${n.height}@${n.fps} ${n.maxBitrateKbps}kbps`
+        );
+        const old = session.ffmpeg;
+        session.ffmpeg = null;
+        try {
+          old?.kill("SIGKILL");
+        } catch {
+          /* gone */
+        }
+        this.spawnFfmpeg(request.sessionID, session);
         callback();
         break;
+      }
       case this.hap.StreamRequestTypes.STOP:
         this.stopStream(request.sessionID);
         callback();
@@ -241,19 +299,24 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
       return;
     }
 
+    const n = negotiate(request.video);
     const session: ActiveSession = {
       info,
       ffmpeg: null,
       timeout: null,
       videoPt: request.video.pt,
       mtu: request.video.mtu || 1316,
-      fps: Math.min(request.video.fps || 15, 15),
+      fps: n.fps,
+      width: n.width,
+      height: n.height,
+      maxBitrateKbps: n.maxBitrateKbps,
+      lastChangeAt: Date.now(),
       respawns: 0,
     };
 
     this.log.info(
-      `[${this.opts.name}] Starting mosaic: ${this.opts.memberIds.length} cameras @ ` +
-        `${session.fps}fps, pt=${session.videoPt}`
+      `[${this.opts.name}] Starting mosaic: ${this.opts.memberIds.length} cameras, ` +
+        `${session.width}x${session.height}@${session.fps} ${session.maxBitrateKbps}kbps, pt=${session.videoPt}`
     );
 
     const armIdleTimeout = () => {
@@ -282,6 +345,9 @@ export class MosaicStreamingDelegate implements CameraStreamingDelegate {
     const args = buildMosaicArgs({
       sourceUrls: this.sourceUrls(),
       fps: session.fps,
+      width: session.width,
+      height: session.height,
+      maxBitrateKbps: session.maxBitrateKbps,
       video: {
         address: session.info.address,
         port: session.info.videoPort,

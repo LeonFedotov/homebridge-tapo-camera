@@ -185,6 +185,9 @@ const mosaicArgs = buildMosaicArgs({
     `rtsp://127.0.0.1:${rtspPort}/fake2_sub`,
   ],
   fps: 10,
+  width: 640,
+  height: 360,
+  maxBitrateKbps: 400,
   video: {
     address: "127.0.0.1",
     port: mosaicSinkPort,
