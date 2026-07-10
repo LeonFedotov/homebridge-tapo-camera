@@ -349,8 +349,29 @@ export class CameraAccessory {
   }
 
   async setup() {
-    const basicInfo = await this.camera.getBasicInfo();
-    this.log.debug("Basic info", basicInfo);
+    // The camera's HTTPS control API is flaky at boot (TLS resets). Streaming
+    // needs only the RTSP URLs (built from config), so a control-API failure
+    // must NOT block registering the camera with the relay / mosaics — degrade
+    // the info service and recover it on the next status poll instead.
+    let basicInfo: TAPOBasicInfo;
+    try {
+      basicInfo = await this.camera.getBasicInfo();
+      this.log.debug("Basic info", basicInfo);
+    } catch (err) {
+      // A rate-limit suspension is handled by the platform's retry logic.
+      if (err instanceof Error && /Try again in (\d+) seconds/.test(err.message)) {
+        throw err;
+      }
+      this.log.warn(
+        `Control API unavailable at startup (${(err as Error).message}). ` +
+          "Proceeding with streaming; camera info/toggles recover on the next poll."
+      );
+      basicInfo = {
+        device_info: "TAPO Camera",
+        mac: this.config.name,
+        sw_version: "unknown",
+      } as TAPOBasicInfo;
+    }
 
     this.accessory.on(PlatformAccessoryEvent.IDENTIFY, () => {
       this.log.info("Identify requested", basicInfo);
