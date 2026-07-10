@@ -1,5 +1,6 @@
 import { ChildProcess, execFileSync, spawn } from "child_process";
 import { existsSync } from "fs";
+import { dirname, join } from "path";
 import type { Readable } from "stream";
 import { Logging } from "homebridge";
 
@@ -170,7 +171,13 @@ export class HtmlRender {
   private launchSurf(): void {
     const display = this.display;
     if (this.stopped || !display) return;
-    const env = { ...process.env, DISPLAY: display };
+    const env: NodeJS.ProcessEnv = { ...process.env, DISPLAY: display };
+    // surf's web extension lives next to the binary in the bundled builds;
+    // point WEBEXTDIR at it if present (matches the homekit-html-camera setup).
+    const webextDir = dirname(this.surfPath);
+    if (existsSync(join(webextDir, "webext-surf.so"))) {
+      env.WEBEXTDIR = webextDir;
+    }
 
     try { this.unclutter?.kill("SIGTERM"); } catch { /* gone */ }
     this.unclutter = spawn("unclutter", ["-idle", "0", "-root"], { env, stdio: "ignore" });
