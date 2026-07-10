@@ -13,6 +13,8 @@ export type HtmlCameraConfig = {
   width?: number;
   height?: number;
   fps?: number;
+  /** Refresh the idle preview every N seconds (min 10; 0/undefined = off). */
+  previewRefreshSeconds?: number;
 };
 
 /**

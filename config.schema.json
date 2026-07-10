@@ -169,9 +169,21 @@
           "url": { "title": "Page URL", "type": "string", "required": true, "description": "The HTML page to render" },
           "width": { "title": "Width", "type": "integer", "default": 1280, "minimum": 320, "maximum": 1920 },
           "height": { "title": "Height", "type": "integer", "default": 720, "minimum": 180, "maximum": 1080 },
-          "fps": { "title": "FPS", "type": "integer", "default": 15, "minimum": 1, "maximum": 30 }
+          "fps": { "title": "FPS", "type": "integer", "default": 15, "minimum": 1, "maximum": 30 },
+          "previewRefreshSeconds": {
+            "title": "Preview Refresh (seconds)",
+            "type": "integer",
+            "minimum": 0,
+            "description": "Keep the idle Home-app preview current by briefly rendering every N seconds (minimum 10). 0 = off: the preview shows the last frame from when you last watched (lowest CPU). Higher = fresher previews at more CPU, since a preview of a rendered page requires rendering it."
+          }
         }
       }
+    },
+    "previewRefreshSeconds": {
+      "title": "Default Preview Refresh (seconds)",
+      "type": "integer",
+      "minimum": 0,
+      "description": "Default idle-preview refresh for all HTML cameras (minimum 10; 0 = off). Overridden per-camera."
     },
     "mosaics": {
       "title": "Mosaics",

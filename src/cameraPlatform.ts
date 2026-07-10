@@ -17,6 +17,7 @@ import {
   resolveX11grabFfmpeg,
 } from "./streaming/htmlRender";
 import { HtmlRenderManager } from "./streaming/htmlRenderManager";
+import { MIN_REFRESH_SECONDS, PreviewRefresher } from "./streaming/previewRefresher";
 import { SnapshotStore } from "./streaming/snapshotStore";
 import { SourceProvider } from "./streaming/sourceProvider";
 
@@ -32,6 +33,8 @@ export interface CameraPlatformConfig extends PlatformConfig {
   go2rtcPath?: string;
   surfPath?: string;
   htmlFfmpegPath?: string;
+  /** Default idle-preview refresh for HTML cameras, seconds (min 10; 0 = off). */
+  previewRefreshSeconds?: number;
 }
 
 type Shutdownable = { shutdown(): void };
@@ -44,6 +47,7 @@ export class CameraPlatform implements IndependentPlatformPlugin {
   public readonly renderManager = new HtmlRenderManager();
 
   private readonly delegates: Shutdownable[] = [];
+  private readonly refreshers: PreviewRefresher[] = [];
   private readonly cameraIds = new Set<string>();
   private readonly idByName = new Map<string, string>();
   private readonly order: string[] = [];
@@ -58,6 +62,7 @@ export class CameraPlatform implements IndependentPlatformPlugin {
     this.snapshotStore = new SnapshotStore(log, workDir);
 
     api.on(APIEvent.SHUTDOWN, () => {
+      this.refreshers.forEach((r) => r.stop());
       this.delegates.forEach((d) => d.shutdown());
       this.renderManager.stopAll();
       this.sourceProvider.stop();
@@ -93,6 +98,7 @@ export class CameraPlatform implements IndependentPlatformPlugin {
       return;
     }
     this.setupMosaics();
+    this.refreshers.forEach((r) => r.start()); // provider is up now
   }
 
   private async setupTapoCamera(cameraConfig: CameraConfig, retry = false): Promise<void> {
@@ -146,7 +152,17 @@ export class CameraPlatform implements IndependentPlatformPlugin {
       accessory.configureController(delegate.controller);
       this.api.publishExternalAccessories(PLUGIN_ID, [accessory]);
       this.registerStreamingCamera(html.name, id, delegate);
-      this.log.info(`HTML camera "${html.name}" ready (lazy render)`);
+
+      const refreshSec = html.previewRefreshSeconds ?? this.config.previewRefreshSeconds ?? 0;
+      if (refreshSec > 0) {
+        const sec = Math.max(MIN_REFRESH_SECONDS, refreshSec);
+        this.refreshers.push(
+          new PreviewRefresher(this.log, id, sec * 1000, this.renderManager, this.sourceProvider, this.snapshotStore)
+        );
+        this.log.info(`HTML camera "${html.name}" ready (lazy render, preview refresh ${sec}s)`);
+      } else {
+        this.log.info(`HTML camera "${html.name}" ready (lazy render)`);
+      }
     } catch (err) {
       render.stop();
       this.log.error(`HTML camera "${html.name}" failed: ${(err as Error).message}`);
