@@ -1,7 +1,7 @@
 {
   "displayName": "Homebridge TAPO Camera NG",
   "name": "homebridge-tapo-camera-ng",
-  "version": "3.0.0-alpha.6",
+  "version": "3.0.0-alpha.7",
   "description": "Homebridge plugin for TP-Link TAPO cameras with a buffered go2rtc source: persistent camera connections, instant stream starts and snapshots, per-session quality tiers, WiFi-blip resilience",
   "main": "dist/index.js",
   "license": "ISC",

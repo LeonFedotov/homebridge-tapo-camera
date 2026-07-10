@@ -227,7 +227,8 @@ export class CameraAccessory {
       const snapshots = new SnapshotService(
         this.log,
         this.platform.sourceProvider,
-        cameraId
+        cameraId,
+        this.platform.snapshotStore
       );
 
       const delegate = new TapoStreamingDelegate(this.log, this.api.hap, {

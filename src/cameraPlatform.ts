@@ -8,6 +8,7 @@ import {
 import path from "path";
 import { CameraAccessory, CameraConfig } from "./cameraAccessory";
 import { PLUGIN_ID } from "./pkg";
+import { CompositeStreamingDelegate } from "./streaming/compositeDelegate";
 import { Go2rtcManager } from "./streaming/go2rtcManager";
 import {
   buildCaptureCommand,
@@ -15,26 +16,21 @@ import {
   HtmlRender,
   resolveX11grabFfmpeg,
 } from "./streaming/htmlRender";
-import { MosaicStreamingDelegate } from "./streaming/mosaicDelegate";
-import { SnapshotService } from "./streaming/snapshotService";
+import { HtmlRenderManager } from "./streaming/htmlRenderManager";
+import { SnapshotStore } from "./streaming/snapshotStore";
 import { SourceProvider } from "./streaming/sourceProvider";
-import { TapoStreamingDelegate } from "./streaming/streamingDelegate";
 
 export type MosaicConfig = {
   name: string;
-  /** Camera names (as configured), in grid order. Omit for all cameras. */
-  cameras?: string[];
+  cameras?: string[]; // member camera names, in grid order; omit for all
 };
 
 export interface CameraPlatformConfig extends PlatformConfig {
   cameras?: CameraConfig[];
   htmlCameras?: HtmlCameraConfig[];
   mosaics?: MosaicConfig[];
-  /** Explicit go2rtc binary path (overrides the downloaded one). */
   go2rtcPath?: string;
-  /** surf binary path for HTML cameras (default /usr/bin/surf). */
   surfPath?: string;
-  /** x11grab-capable ffmpeg for HTML capture (auto-detected if unset). */
   htmlFfmpegPath?: string;
 }
 
@@ -44,36 +40,34 @@ export class CameraPlatform implements IndependentPlatformPlugin {
   public readonly kDefaultPullInterval = 60000;
 
   public readonly sourceProvider: SourceProvider;
+  public readonly snapshotStore: SnapshotStore;
+  public readonly renderManager = new HtmlRenderManager();
+
   private readonly delegates: Shutdownable[] = [];
-  private readonly htmlRenders: HtmlRender[] = [];
   private readonly cameraIds = new Set<string>();
-  /** Ordered registry of streaming cameras: config name → relay id. */
   private readonly idByName = new Map<string, string>();
-  private readonly order: string[] = []; // camera names, registration order
+  private readonly order: string[] = [];
 
   constructor(
     public readonly log: Logging,
     public readonly config: CameraPlatformConfig,
     public readonly api: API
   ) {
-    this.sourceProvider = new Go2rtcManager(log, {
-      workDir: path.join(api.user.storagePath(), "tapo-camera-ng"),
-      binaryPath: this.config.go2rtcPath,
-    });
+    const workDir = path.join(api.user.storagePath(), "tapo-camera-ng");
+    this.sourceProvider = new Go2rtcManager(log, { workDir, binaryPath: this.config.go2rtcPath });
+    this.snapshotStore = new SnapshotStore(log, workDir);
 
     api.on(APIEvent.SHUTDOWN, () => {
       this.delegates.forEach((d) => d.shutdown());
-      this.htmlRenders.forEach((r) => r.stop());
+      this.renderManager.stopAll();
       this.sourceProvider.stop();
     });
 
     void this.discoverDevices();
   }
 
-  /** Stable unique slug for relay stream names. */
   public claimCameraId(name: string): string {
-    const base =
-      name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "cam";
+    const base = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "cam";
     let id = base;
     let n = 2;
     while (this.cameraIds.has(id)) id = `${base}-${n++}`;
@@ -81,7 +75,6 @@ export class CameraPlatform implements IndependentPlatformPlugin {
     return id;
   }
 
-  /** Called by camera accessories once they've registered a relay source. */
   public registerStreamingCamera(name: string, id: string, delegate: Shutdownable): void {
     this.idByName.set(name, id);
     this.order.push(name);
@@ -89,25 +82,16 @@ export class CameraPlatform implements IndependentPlatformPlugin {
   }
 
   private async discoverDevices(): Promise<void> {
-    // Tapo cameras (register their RTSP tiers with the relay).
-    await Promise.allSettled(
-      (this.config.cameras ?? []).map((c) => this.setupTapoCamera(c))
-    );
-
-    // HTML cameras (start Xvfb+surf, register an exec capture source).
-    for (const html of this.config.htmlCameras ?? []) {
-      await this.setupHtmlCamera(html);
-    }
+    await Promise.allSettled((this.config.cameras ?? []).map((c) => this.setupTapoCamera(c)));
+    for (const html of this.config.htmlCameras ?? []) await this.setupHtmlCamera(html);
 
     if (this.order.length === 0) return;
-
     try {
       await this.sourceProvider.start();
     } catch (err) {
       this.log.error(`Buffered video source failed to start: ${(err as Error).message}`);
       return;
     }
-
     this.setupMosaics();
   }
 
@@ -131,49 +115,38 @@ export class CameraPlatform implements IndependentPlatformPlugin {
     const ffmpeg = resolveX11grabFfmpeg(this.config.htmlFfmpegPath);
     if (!ffmpeg) {
       this.log.error(
-        `HTML camera "${html.name}" skipped: no x11grab-capable ffmpeg found. ` +
-          "Set htmlFfmpegPath, or install one (ffmpeg-for-homebridge lacks x11grab)."
+        `HTML camera "${html.name}" skipped: no x11grab-capable ffmpeg found. Set htmlFfmpegPath.`
       );
       return;
     }
     const surfPath = this.config.surfPath ?? "/usr/bin/surf";
     const render = new HtmlRender(this.log, html, surfPath);
     try {
-      const display = await render.start();
-      this.htmlRenders.push(render);
+      const display = await render.start(); // Xvfb only; surf is lazy
       const id = this.claimCameraId(html.name);
+      this.renderManager.register(id, render);
       this.sourceProvider.registerCamera({
         id,
         kind: "exec",
-        command: buildCaptureCommand({
-          ffmpeg,
-          display,
-          width: render.width,
-          height: render.height,
-          fps: render.fps,
-        }),
+        command: buildCaptureCommand({ ffmpeg, display, width: render.width, height: render.height, fps: render.fps }),
       });
 
-      // Standalone HomeKit camera, served from the relay like any camera.
       const accessory = new this.api.platformAccessory(
         html.name,
         this.api.hap.uuid.generate(`html:${html.name}`),
         this.api.hap.Categories.CAMERA
       );
-      const tier = { width: render.width, height: render.height, approxBitrateKbps: 2048 };
-      const delegate = new TapoStreamingDelegate(this.log, this.api.hap, {
+      const delegate = new CompositeStreamingDelegate(this.log, this.api.hap, {
         name: html.name,
-        cameraId: id,
         provider: this.sourceProvider,
-        snapshots: new SnapshotService(this.log, this.sourceProvider, id),
-        disableAudio: true,
-        mainTier: tier,
-        subTier: tier,
+        memberIds: [id],
+        renderManager: this.renderManager,
+        snapshotStore: this.snapshotStore,
       });
       accessory.configureController(delegate.controller);
       this.api.publishExternalAccessories(PLUGIN_ID, [accessory]);
       this.registerStreamingCamera(html.name, id, delegate);
-      this.log.info(`HTML camera "${html.name}" ready`);
+      this.log.info(`HTML camera "${html.name}" ready (lazy render)`);
     } catch (err) {
       render.stop();
       this.log.error(`HTML camera "${html.name}" failed: ${(err as Error).message}`);
@@ -183,11 +156,9 @@ export class CameraPlatform implements IndependentPlatformPlugin {
   private setupMosaics(): void {
     let mosaics = this.config.mosaics;
     if (!mosaics || mosaics.length === 0) {
-      // Auto: one mosaic of all cameras — but only when there's more than one.
       if (this.order.length < 2) return;
       mosaics = [{ name: "Mosaic", cameras: [...this.order] }];
     }
-
     for (const mosaic of mosaics) {
       const names = mosaic.cameras && mosaic.cameras.length > 0 ? mosaic.cameras : this.order;
       const memberIds: string[] = [];
@@ -200,16 +171,17 @@ export class CameraPlatform implements IndependentPlatformPlugin {
         this.log.warn(`Mosaic "${mosaic.name}" needs at least 2 valid cameras, skipping`);
         continue;
       }
-
       const accessory = new this.api.platformAccessory(
         mosaic.name,
         this.api.hap.uuid.generate(`mosaic:${mosaic.name}`),
         this.api.hap.Categories.CAMERA
       );
-      const delegate = new MosaicStreamingDelegate(this.log, this.api.hap, {
+      const delegate = new CompositeStreamingDelegate(this.log, this.api.hap, {
         name: mosaic.name,
         provider: this.sourceProvider,
         memberIds,
+        renderManager: this.renderManager,
+        snapshotStore: this.snapshotStore,
       });
       accessory.configureController(delegate.controller);
       this.api.publishExternalAccessories(PLUGIN_ID, [accessory]);

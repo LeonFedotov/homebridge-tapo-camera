@@ -17,24 +17,15 @@ export type HtmlCameraConfig = {
 
 /**
  * Locate an ffmpeg that supports x11grab. ffmpeg-for-homebridge (used for the
- * Tapo audio path) does NOT, so HTML capture needs a separate binary. Checks
- * an explicit path, then common system locations.
+ * Tapo audio path) does NOT, so HTML capture needs a separate binary.
  */
 export function resolveX11grabFfmpeg(explicit?: string): string | null {
-  const candidates = [
-    explicit,
-    process.env.HTML_FFMPEG_PATH,
-    "/usr/bin/ffmpeg",
-    "/usr/local/bin/ffmpeg",
-    "/opt/homebrew/bin/ffmpeg",
-  ].filter((p): p is string => Boolean(p));
-  for (const candidate of candidates) {
-    if (candidate !== "/usr/bin/ffmpeg" &&
-        candidate !== "/usr/local/bin/ffmpeg" &&
-        candidate !== "/opt/homebrew/bin/ffmpeg" &&
-        !existsSync(candidate)) {
-      continue;
-    }
+  const explicitPaths = [explicit, process.env.HTML_FFMPEG_PATH].filter(
+    (p): p is string => Boolean(p)
+  );
+  const systemPaths = ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"];
+  for (const candidate of [...explicitPaths, ...systemPaths]) {
+    if (explicitPaths.includes(candidate) && !existsSync(candidate)) continue;
     try {
       const out = execFileSync(candidate, ["-hide_banner", "-devices"], {
         encoding: "utf8",
@@ -42,17 +33,13 @@ export function resolveX11grabFfmpeg(explicit?: string): string | null {
       });
       if (/x11grab/.test(out)) return candidate;
     } catch {
-      /* not runnable / no such binary */
+      /* not runnable */
     }
   }
   return null;
 }
 
-/**
- * go2rtc `exec:` source that captures the X display as H.264 and publishes to
- * the RTSP URL go2rtc substitutes for {output}. The `exec:` prefix is required
- * — without it go2rtc treats the string as an unknown source and starts nothing.
- */
+/** go2rtc `exec:` source that captures the X display as H.264 RTSP. */
 export function buildCaptureCommand(opts: {
   ffmpeg: string;
   display: string;
@@ -79,10 +66,11 @@ export function buildCaptureCommand(opts: {
 }
 
 /**
- * Renders one HTML page on a private X display: Xvfb picks a free display via
- * -displayfd, surf renders the URL, both supervised with backoff. The rendered
- * display is captured by a go2rtc exec source (see buildCaptureCommand), so
- * from go2rtc's perspective an HTML camera is just another stream.
+ * Renders one HTML page on a private X display. The Xvfb display stays up for
+ * the life of the plugin (idle cost ~0), but surf — which is the real CPU
+ * cost (WebKit rendering, esp. animated pages) — runs only while a client is
+ * watching. surf is started/stopped on demand via ensureSurf()/stopSurf(),
+ * driven by the render manager's refcount.
  */
 export class HtmlRender {
   readonly width: number;
@@ -94,6 +82,7 @@ export class HtmlRender {
   private surf: ChildProcess | null = null;
   private unclutter: ChildProcess | null = null;
   private stopped = false;
+  private surfWanted = false;
   private xvfbRestarts = 0;
   private surfRestarts = 0;
 
@@ -107,7 +96,7 @@ export class HtmlRender {
     this.fps = config.fps ?? 15;
   }
 
-  /** Start Xvfb + surf; resolves with the display number once rendering. */
+  /** Start the Xvfb display (NOT surf); resolves with the display number. */
   start(): Promise<string> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(
@@ -123,6 +112,10 @@ export class HtmlRender {
 
   get displayNumber(): string | null {
     return this.display;
+  }
+
+  get isRendering(): boolean {
+    return this.surf !== null;
   }
 
   private startXvfb(onReady: (display: string) => void): void {
@@ -154,7 +147,8 @@ export class HtmlRender {
       setTimeout(() => {
         if (this.xvfb === xvfb) this.xvfbRestarts = 0;
       }, RESTART_BACKOFF_RESET_MS).unref();
-      this.launchSurf();
+      // If a viewer was already waiting, (re)start surf now that the display exists.
+      if (this.surfWanted) this.launchSurf();
       onReady(this.display);
     });
 
@@ -172,22 +166,52 @@ export class HtmlRender {
     });
   }
 
+  /** Ensure surf is rendering the page (starts it if not already). */
+  ensureSurf(): void {
+    if (this.stopped) return;
+    this.surfWanted = true;
+    if (!this.surf && this.display) this.launchSurf();
+  }
+
+  /** Stop surf (frees the WebKit CPU); the Xvfb display stays up. */
+  stopSurf(): void {
+    this.surfWanted = false;
+    try {
+      this.surf?.kill("SIGTERM");
+    } catch {
+      /* gone */
+    }
+    try {
+      this.unclutter?.kill("SIGTERM");
+    } catch {
+      /* gone */
+    }
+    this.surf = null;
+    this.unclutter = null;
+    this.log.debug(`[${this.config.name}] surf stopped (idle)`);
+  }
+
   private launchSurf(): void {
     const display = this.display;
-    if (this.stopped || !display) return;
+    if (this.stopped || !display || !this.surfWanted) return;
+
     const env: NodeJS.ProcessEnv = { ...process.env, DISPLAY: display };
-    // surf's web extension lives next to the binary in the bundled builds;
-    // point WEBEXTDIR at it if present (matches the homekit-html-camera setup).
     const webextDir = dirname(this.surfPath);
-    if (existsSync(join(webextDir, "webext-surf.so"))) {
-      env.WEBEXTDIR = webextDir;
+    if (existsSync(join(webextDir, "webext-surf.so"))) env.WEBEXTDIR = webextDir;
+
+    try {
+      this.unclutter?.kill("SIGTERM");
+    } catch {
+      /* gone */
     }
-
-    try { this.unclutter?.kill("SIGTERM"); } catch { /* gone */ }
     this.unclutter = spawn("unclutter", ["-idle", "0", "-root"], { env, stdio: "ignore" });
-    this.unclutter.on("error", () => { /* cosmetic; ignore */ });
+    this.unclutter.on("error", () => { /* cosmetic */ });
 
-    try { this.surf?.kill("SIGTERM"); } catch { /* gone */ }
+    try {
+      this.surf?.kill("SIGTERM");
+    } catch {
+      /* gone */
+    }
     const surf = spawn(this.surfPath, [this.config.url], { env, stdio: ["ignore", "ignore", "pipe"] });
     this.surf = surf;
     this.log.info(`[${this.config.name}] surf rendering ${this.config.url}`);
@@ -200,19 +224,26 @@ export class HtmlRender {
     surf.on("error", (err) => this.log.error(`[${this.config.name}] surf failed: ${err.message}`));
     surf.on("exit", (code, signal) => {
       if (this.stopped || this.surf !== surf) return;
+      this.surf = null;
+      if (!this.surfWanted) return; // intentional stop
       const delay = Math.min(RESTART_BACKOFF_MAX_MS, 1000 * 2 ** this.surfRestarts);
       this.surfRestarts++;
       this.log.warn(`[${this.config.name}] surf exited (${code ?? signal}), relaunching in ${delay / 1000}s`);
       setTimeout(() => {
-        if (!this.stopped && this.surf === surf) this.launchSurf();
+        if (!this.stopped && this.surfWanted && !this.surf) this.launchSurf();
       }, delay).unref();
     });
   }
 
   stop(): void {
     this.stopped = true;
+    this.surfWanted = false;
     for (const p of [this.surf, this.unclutter, this.xvfb]) {
-      try { p?.kill("SIGTERM"); } catch { /* gone */ }
+      try {
+        p?.kill("SIGTERM");
+      } catch {
+        /* gone */
+      }
     }
     this.surf = null;
     this.unclutter = null;

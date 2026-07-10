@@ -181,7 +181,8 @@ mosaicSink.bind(mosaicSinkPort);
 
 const mosaicArgs = buildMosaicArgs({
   totalSlots: 2,
-  tiles: [
+  covers: [],
+  live: [
     { slot: 0, url: `rtsp://127.0.0.1:${rtspPort}/fake_sub` },
     { slot: 1, url: `rtsp://127.0.0.1:${rtspPort}/fake2_sub` },
   ],
