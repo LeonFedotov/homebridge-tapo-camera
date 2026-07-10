@@ -1,8 +1,8 @@
 {
-  "displayName": "Homebridge TAPO Camera NG",
-  "name": "homebridge-tapo-camera-ng",
+  "displayName": "Homebridge TAPO Hub",
+  "name": "homebridge-tapo-hub",
   "version": "3.0.0-alpha.8",
-  "description": "Homebridge plugin for TP-Link TAPO cameras with a buffered go2rtc source: persistent camera connections, instant stream starts and snapshots, per-session quality tiers, WiFi-blip resilience",
+  "description": "Homebridge camera plugin for TP-Link TAPO (and any RTSP) cameras with a buffered go2rtc source — resilient streaming, instant snapshots, HTML virtual cameras, and multi-camera mosaics",
   "main": "dist/index.js",
   "license": "ISC",
   "scripts": {
@@ -19,7 +19,10 @@
     "homebridge-plugin",
     "tapo",
     "camera",
-    "tplink"
+    "tplink",
+    "go2rtc",
+    "mosaic",
+    "rtsp"
   ],
   "bugs": {
     "url": "https://github.com/LeonFedotov/homebridge-tapo-camera/issues"
