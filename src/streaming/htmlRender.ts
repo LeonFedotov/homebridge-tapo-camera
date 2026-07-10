@@ -48,7 +48,11 @@ export function resolveX11grabFfmpeg(explicit?: string): string | null {
   return null;
 }
 
-/** go2rtc exec source command that captures the X display as H.264 RTSP. */
+/**
+ * go2rtc `exec:` source that captures the X display as H.264 and publishes to
+ * the RTSP URL go2rtc substitutes for {output}. The `exec:` prefix is required
+ * — without it go2rtc treats the string as an unknown source and starts nothing.
+ */
 export function buildCaptureCommand(opts: {
   ffmpeg: string;
   display: string;
@@ -57,7 +61,7 @@ export function buildCaptureCommand(opts: {
   fps: number;
 }): string {
   return [
-    opts.ffmpeg,
+    `exec:${opts.ffmpeg}`,
     "-hide_banner", "-loglevel", "error",
     "-f", "x11grab",
     "-video_size", `${opts.width}x${opts.height}`,
