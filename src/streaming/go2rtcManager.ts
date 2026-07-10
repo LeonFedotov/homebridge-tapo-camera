@@ -22,6 +22,11 @@ export type Go2rtcManagerOptions = {
   binaryPath?: string;
 };
 
+/** Single-quoted YAML scalar (handles spaces, colons, quotes in URLs/commands). */
+function yamlScalar(s: string): string {
+  return `'${s.replace(/'/g, "''")}'`;
+}
+
 /** Pure so tests can lock the generated config exactly. */
 export function renderGo2rtcConfig(opts: {
   apiPort: number;
@@ -46,8 +51,12 @@ export function renderGo2rtcConfig(opts: {
     "streams:",
   ];
   for (const cam of opts.cameras) {
-    lines.push(`  ${cam.id}_main: "${cam.mainUrl}"`);
-    lines.push(`  ${cam.id}_sub: "${cam.subUrl}"`);
+    if (cam.kind === "rtsp") {
+      lines.push(`  ${cam.id}_main: ${yamlScalar(cam.mainUrl)}`);
+      lines.push(`  ${cam.id}_sub: ${yamlScalar(cam.subUrl)}`);
+    } else {
+      lines.push(`  ${cam.id}: ${yamlScalar(cam.command)}`);
+    }
   }
   return lines.join("\n") + "\n";
 }
@@ -86,11 +95,14 @@ export class Go2rtcManager implements SourceProvider {
     private readonly opts: Go2rtcManagerOptions
   ) {}
 
+  private readonly kinds = new Map<string, "rtsp" | "exec">();
+
   registerCamera(config: CameraSourceConfig): void {
     if (!/^[A-Za-z0-9-]+$/.test(config.id)) {
       throw new Error(`Invalid camera id "${config.id}"`);
     }
     this.cameras.push(config);
+    this.kinds.set(config.id, config.kind);
   }
 
   private resolveBinary(): string {
@@ -229,14 +241,21 @@ export class Go2rtcManager implements SourceProvider {
     return this.ready;
   }
 
+  /** Relay stream name: rtsp cameras are per-tier, exec cameras single. */
+  private streamName(cameraId: string, tier: StreamTier): string {
+    return this.kinds.get(cameraId) === "exec"
+      ? cameraId
+      : `${cameraId}_${tier}`;
+  }
+
   getSourceUrl(cameraId: string, tier: StreamTier): string {
     if (this.rtspPort === 0) throw new Error("go2rtc not started");
-    return `rtsp://127.0.0.1:${this.rtspPort}/${cameraId}_${tier}`;
+    return `rtsp://127.0.0.1:${this.rtspPort}/${this.streamName(cameraId, tier)}`;
   }
 
   async getFrame(cameraId: string): Promise<Buffer> {
     const res = await fetch(
-      `http://127.0.0.1:${this.apiPort}/api/frame.jpeg?src=${cameraId}_sub`,
+      `http://127.0.0.1:${this.apiPort}/api/frame.jpeg?src=${this.streamName(cameraId, "sub")}`,
       { signal: AbortSignal.timeout(8000) }
     );
     if (!res.ok) throw new Error(`frame.jpeg returned ${res.status}`);

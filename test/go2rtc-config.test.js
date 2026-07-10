@@ -5,15 +5,21 @@ const assert = require("node:assert/strict");
 
 const { renderGo2rtcConfig } = require("../dist/streaming/go2rtcManager");
 
-test("generated go2rtc config: localhost-only listeners, both tiers per camera", () => {
+test("rtsp + exec cameras: localhost-only, single-quoted values, per-kind streams", () => {
   const yaml = renderGo2rtcConfig({
     apiPort: 1984,
     rtspPort: 8554,
     cameras: [
       {
         id: "home",
-        mainUrl: "rtsp://user:pass@192.168.0.208:554/stream1",
-        subUrl: "rtsp://user:pass@192.168.0.208:554/stream2",
+        kind: "rtsp",
+        mainUrl: "rtsp://user:p@ss@192.168.0.208:554/stream1",
+        subUrl: "rtsp://user:p@ss@192.168.0.208:554/stream2",
+      },
+      {
+        id: "dashboard",
+        kind: "exec",
+        command: "/usr/bin/ffmpeg -f x11grab -i :7.0 -f rtsp {output}",
       },
     ],
   });
@@ -35,9 +41,19 @@ test("generated go2rtc config: localhost-only listeners, both tiers per camera",
       "log:",
       "  level: warn",
       "streams:",
-      '  home_main: "rtsp://user:pass@192.168.0.208:554/stream1"',
-      '  home_sub: "rtsp://user:pass@192.168.0.208:554/stream2"',
+      "  home_main: 'rtsp://user:p@ss@192.168.0.208:554/stream1'",
+      "  home_sub: 'rtsp://user:p@ss@192.168.0.208:554/stream2'",
+      "  dashboard: '/usr/bin/ffmpeg -f x11grab -i :7.0 -f rtsp {output}'",
       "",
     ].join("\n")
   );
+});
+
+test("single quotes inside a value are escaped by doubling", () => {
+  const yaml = renderGo2rtcConfig({
+    apiPort: 1,
+    rtspPort: 2,
+    cameras: [{ id: "x", kind: "exec", command: "echo 'hi'" }],
+  });
+  assert.match(yaml, /  x: 'echo ''hi'''/);
 });

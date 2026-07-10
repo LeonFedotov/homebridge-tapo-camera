@@ -158,10 +158,52 @@
         }
       }
     },
+    "htmlCameras": {
+      "title": "HTML Cameras",
+      "type": "array",
+      "description": "Virtual cameras that render a web page (via Xvfb + surf) as a stream. Each appears as its own HomeKit camera and can be included in mosaics.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "title": "Name", "type": "string", "required": true },
+          "url": { "title": "Page URL", "type": "string", "required": true, "description": "The HTML page to render" },
+          "width": { "title": "Width", "type": "integer", "default": 1280, "minimum": 320, "maximum": 1920 },
+          "height": { "title": "Height", "type": "integer", "default": 720, "minimum": 180, "maximum": 1080 },
+          "fps": { "title": "FPS", "type": "integer", "default": 15, "minimum": 1, "maximum": 30 }
+        }
+      }
+    },
+    "mosaics": {
+      "title": "Mosaics",
+      "type": "array",
+      "description": "Virtual cameras that tile several cameras into one grid. Leave empty for one automatic mosaic of all cameras (only when 2+ exist).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "title": "Mosaic Name", "type": "string", "required": true },
+          "cameras": {
+            "title": "Cameras (in grid order)",
+            "type": "array",
+            "description": "Camera names (Tapo or HTML) to include, in the order they should tile. Leave empty to include all cameras.",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
     "go2rtcPath": {
       "title": "go2rtc Binary Path",
       "type": "string",
       "description": "Optional path to a go2rtc binary. Defaults to the pinned version downloaded on install."
+    },
+    "surfPath": {
+      "title": "surf Binary Path",
+      "type": "string",
+      "description": "Path to the surf browser for HTML cameras. Defaults to /usr/bin/surf."
+    },
+    "htmlFfmpegPath": {
+      "title": "HTML Capture ffmpeg Path",
+      "type": "string",
+      "description": "Path to an ffmpeg with x11grab support, used to capture HTML cameras. Auto-detected if unset (the bundled audio ffmpeg lacks x11grab)."
     }
   }
 }

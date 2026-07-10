@@ -23,6 +23,7 @@ const require = createRequire(import.meta.url);
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const { renderGo2rtcConfig } = require(join(root, "dist/streaming/go2rtcManager"));
 const { buildSessionArgs } = require(join(root, "dist/streaming/ffmpegArgs"));
+const { buildMosaicArgs } = require(join(root, "dist/streaming/mosaic"));
 
 const GO2RTC = process.env.GO2RTC_PATH || join(root, "bin", "go2rtc");
 let ffmpegPath = "ffmpeg";
@@ -80,7 +81,10 @@ writeFileSync(
   renderGo2rtcConfig({
     apiPort,
     rtspPort,
-    cameras: [{ id: "fake", mainUrl: fakeSource, subUrl: fakeSource }],
+    cameras: [
+      { id: "fake", kind: "rtsp", mainUrl: fakeSource, subUrl: fakeSource },
+      { id: "fake2", kind: "rtsp", mainUrl: fakeSource, subUrl: fakeSource },
+    ],
   })
 );
 
@@ -168,9 +172,47 @@ if (audioPackets < 20) {
 }
 ok(`session copy+audio: ${videoPackets} video / ${audioPackets} audio SRTP packets in 8s`);
 
+// --- 4. mosaic: composite both relay streams into one grid ------------------
+const mosaicSinkPort = await freePort();
+let mosaicPackets = 0;
+const mosaicSink = createSocket("udp4");
+mosaicSink.on("message", () => mosaicPackets++);
+mosaicSink.bind(mosaicSinkPort);
+
+const mosaicArgs = buildMosaicArgs({
+  sourceUrls: [
+    `rtsp://127.0.0.1:${rtspPort}/fake_sub`,
+    `rtsp://127.0.0.1:${rtspPort}/fake2_sub`,
+  ],
+  fps: 10,
+  video: {
+    address: "127.0.0.1",
+    port: mosaicSinkPort,
+    payloadType: 99,
+    ssrc: 3333,
+    srtpParams: Buffer.alloc(30, 5).toString("base64"),
+    mtu: 1378,
+  },
+});
+const mosaic = spawn(ffmpegPath, mosaicArgs, { stdio: ["pipe", "ignore", "pipe"] });
+children.push(mosaic);
+let mosaicErr = "";
+mosaic.stderr.on("data", (d) => (mosaicErr += d.toString()));
+await new Promise((r) => setTimeout(r, 8000));
+try {
+  mosaic.kill("SIGKILL");
+} catch {
+  /* gone */
+}
+if (mosaicPackets < 50) {
+  fail(`expected >50 mosaic SRTP packets, got ${mosaicPackets}. ffmpeg stderr: ${mosaicErr.slice(-500)}`);
+}
+ok(`mosaic (2-cam xstack): ${mosaicPackets} SRTP packets in 8s`);
+mosaicSink.close();
+
 videoSink.close();
 audioSink.close();
 cleanup();
 rmSync(workDir, { recursive: true, force: true });
-console.log("PASS: relay + snapshot + session pipeline verified without a camera");
+console.log("PASS: relay + snapshot + session + mosaic pipeline verified without a camera");
 process.exit(0);

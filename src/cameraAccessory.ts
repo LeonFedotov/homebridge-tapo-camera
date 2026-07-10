@@ -219,6 +219,7 @@ export class CameraAccessory {
       const cameraId = this.platform.claimCameraId(this.config.name);
       this.platform.sourceProvider.registerCamera({
         id: cameraId,
+        kind: "rtsp",
         mainUrl: this.camera.getAuthenticatedStreamUrl(false),
         subUrl: this.camera.getAuthenticatedStreamUrl(true),
       });
@@ -240,9 +241,8 @@ export class CameraAccessory {
           ? { ...DEFAULT_SUB_TIER, approxBitrateKbps: this.config.subBitrateKbps }
           : undefined,
       });
-      this.platform.registerDelegate(delegate);
-
       this.accessory.configureController(delegate.controller);
+      this.platform.registerStreamingCamera(this.config.name, cameraId, delegate);
 
       this.log.debug(
         "Camera streaming setup done (buffered source, model:",
