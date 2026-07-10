@@ -1,14 +1,17 @@
 {
-  "displayName": "Homebridge TAPO Camera",
-  "name": "homebridge-tapo-camera",
-  "version": "2.9.1",
-  "description": "Homebridge plugin for TP-Link TAPO security cameras",
+  "displayName": "Homebridge TAPO Camera NG",
+  "name": "homebridge-tapo-camera-ng",
+  "version": "3.0.0-alpha.1",
+  "description": "Homebridge plugin for TP-Link TAPO cameras with a buffered go2rtc source: persistent camera connections, instant stream starts and snapshots, per-session quality tiers, WiFi-blip resilience",
   "main": "dist/index.js",
   "license": "ISC",
   "scripts": {
     "lint": "eslint src/**.ts --max-warnings=0",
     "watch": "npm run build && npm link && nodemon",
     "build": "rimraf ./dist && tsc",
+    "test": "npm run build && node --test",
+    "test:integration": "node test/integration-fake-camera.mjs",
+    "postinstall": "node scripts/download-go2rtc.mjs",
     "prepublishOnly": "npm run lint && npm run build"
   },
   "keywords": [
@@ -18,7 +21,7 @@
     "tplink"
   ],
   "bugs": {
-    "url": "https://github.com/kopiro/homebridge-tapo-camera/issues"
+    "url": "https://github.com/LeonFedotov/homebridge-tapo-camera/issues"
   },
   "engines": {
     "node": "^18.13.0 || ^20.16.0 || ^22.5.1 || ^24.12.0",
@@ -26,24 +29,26 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/kopiro/homebridge-tapo-camera"
+    "url": "https://github.com/LeonFedotov/homebridge-tapo-camera"
   },
   "files": [
     "dist",
     "LICENSE",
-    "config.schema.json"
+    "config.schema.json",
+    "scripts"
   ],
   "author": {
-    "name": "Flavio De Stefano",
-    "email": "destefano.flavio@gmail.com",
-    "url": "https://www.kopiro.me"
+    "name": "Leon Fedotov"
   },
-  "funding": {
-    "type": "paypal",
-    "url": "https://www.paypal.me/kopiro"
-  },
+  "contributors": [
+    {
+      "name": "Flavio De Stefano (original homebridge-tapo-camera author)",
+      "email": "destefano.flavio@gmail.com",
+      "url": "https://www.kopiro.me"
+    }
+  ],
   "dependencies": {
-    "homebridge-camera-ffmpeg": "^3.1.4",
+    "ffmpeg-for-homebridge": "^2.2.2",
     "onvif": "^0.7.4",
     "undici": "^6.21.0"
   },

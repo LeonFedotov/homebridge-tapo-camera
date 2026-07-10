@@ -5,12 +5,12 @@ import {
   PlatformAccessoryEvent,
   Service,
 } from "homebridge";
-import { StreamingDelegate } from "homebridge-camera-ffmpeg/dist/streamingDelegate";
-import { Logger } from "homebridge-camera-ffmpeg/dist/logger";
 import { Status, TAPOCamera } from "./tapoCamera";
 import { PLUGIN_ID } from "./pkg";
 import { CameraPlatform } from "./cameraPlatform";
-import { VideoConfig } from "homebridge-camera-ffmpeg/dist/configTypes";
+import { SnapshotService } from "./streaming/snapshotService";
+import { TapoStreamingDelegate } from "./streaming/streamingDelegate";
+import { DEFAULT_SUB_TIER } from "./streaming/tierPolicy";
 import { TAPOBasicInfo } from "./types/tapo";
 
 export type CameraConfig = {
@@ -31,19 +31,16 @@ export type CameraConfig = {
   enableFloodLightAccessory?: boolean;
 
   disableMotionSensorAccessory?: boolean;
+
+  /** Disable one-way audio in streams. */
+  disableAudio?: boolean;
+  /** Pin sessions to a camera stream tier instead of automatic selection. */
+  forceTier?: "auto" | "main" | "sub";
+  /** Approximate bitrate of the camera's sub stream (kbps), used by the copy-vs-encode decision. */
+  subBitrateKbps?: number;
+
+  /** @deprecated ng selects tiers automatically; ignored. */
   lowQuality?: boolean;
-
-  videoMaxWidth?: number;
-  videoMaxHeight?: number;
-  videoMaxFPS?: number;
-  videoForceMax?: boolean;
-  videoMaxBitrate?: number;
-  /** @deprecated misspelling of videoMaxBitrate, kept for configs that used it */
-  videoMaxBirate?: number;
-  videoPacketSize?: number;
-  videoCodec?: string;
-
-  videoConfig?: VideoConfig;
 
   eyesToggleAccessoryName?: string;
   alarmToggleAccessoryName?: string;
@@ -204,37 +201,6 @@ export class CameraAccessory {
     }
   }
 
-  private getVideoConfig(): VideoConfig {
-    const streamUrl = this.camera.getAuthenticatedStreamUrl(
-      Boolean(this.config.lowQuality)
-    );
-
-    const vcodec = this.config.videoCodec ?? "copy";
-    const config: VideoConfig = {
-      audio: true, // Set audio as true as most of TAPO cameras have audio
-      vcodec: vcodec,
-      // libx264: force Baseline profile and 1s keyframe interval for HomeKit compatibility.
-      ...(vcodec === "libx264" && {
-        encoderOptions: "-preset ultrafast -tune zerolatency -profile:v baseline -level:v 3.1 -g 30",
-      }),
-      maxWidth: this.config.videoMaxWidth,
-      maxHeight: this.config.videoMaxHeight,
-      maxFPS: this.config.videoMaxFPS,
-      maxBitrate: this.config.videoMaxBitrate ?? this.config.videoMaxBirate,
-      packetSize: this.config.videoPacketSize,
-      forceMax: this.config.videoForceMax,
-      // async resampling prevents backward audio DTS from pcm_alaw packet jitter.
-      mapaudio: "0:a:0 -af aresample=async=16000",
-      ...(this.config.videoConfig || {}),
-      // We add this at the end as the user must not be able to override it
-      source: `-rtsp_transport tcp -i ${streamUrl}`,
-    };
-
-    this.log.debug("Video config", config);
-
-    return config;
-  }
-
   private async setupCameraStreaming(basicInfo: TAPOBasicInfo) {
     try {
       if (!this.hasStreamCredentials()) {
@@ -244,24 +210,45 @@ export class CameraAccessory {
         return;
       }
 
-      const delegate = new StreamingDelegate(
-        new Logger(this.log),
-        {
-          name: this.config.name,
-          manufacturer: "TAPO",
-          model: basicInfo.device_info,
-          serialNumber: basicInfo.mac,
-          firmwareRevision: basicInfo.sw_version,
-          unbridge: true,
-          videoConfig: this.getVideoConfig(),
-        },
-        this.api,
-        this.api.hap
+      if (this.config.lowQuality !== undefined) {
+        this.log.warn(
+          "lowQuality is deprecated and ignored: ng selects the stream tier per session automatically."
+        );
+      }
+
+      const cameraId = this.platform.claimCameraId(this.config.name);
+      this.platform.sourceProvider.registerCamera({
+        id: cameraId,
+        mainUrl: this.camera.getAuthenticatedStreamUrl(false),
+        subUrl: this.camera.getAuthenticatedStreamUrl(true),
+      });
+
+      const snapshots = new SnapshotService(
+        this.log,
+        this.platform.sourceProvider,
+        cameraId
       );
+
+      const delegate = new TapoStreamingDelegate(this.log, this.api.hap, {
+        name: this.config.name,
+        cameraId,
+        provider: this.platform.sourceProvider,
+        snapshots,
+        disableAudio: this.config.disableAudio,
+        forceTier: this.config.forceTier,
+        subTier: this.config.subBitrateKbps
+          ? { ...DEFAULT_SUB_TIER, approxBitrateKbps: this.config.subBitrateKbps }
+          : undefined,
+      });
+      this.platform.registerDelegate(delegate);
 
       this.accessory.configureController(delegate.controller);
 
-      this.log.debug("Camera streaming setup done");
+      this.log.debug(
+        "Camera streaming setup done (buffered source, model:",
+        basicInfo.device_info,
+        ")"
+      );
     } catch (err) {
       this.log.error("Error setting up camera streaming:", err);
     }

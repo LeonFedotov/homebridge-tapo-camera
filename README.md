@@ -1,88 +1,73 @@
-# homebridge-tapo-camera
+# homebridge-tapo-camera-ng
 
-Make your TP-Link TAPO security camera compatible with Homekit through Homebridge / HOOBS.
+Homebridge plugin for TP-Link TAPO cameras with a **buffered video source**:
+a supervised [go2rtc](https://github.com/AlexxIT/go2rtc) relay holds
+persistent connections to the camera so HomeKit sessions never touch the
+flaky WiFi RTSP path directly.
 
-[![verified-by-homebridge](https://badgen.net/badge/homebridge/verified/purple)](https://github.com/homebridge/homebridge/wiki/Verified-Plugins)
+A hard fork of [kopiro/homebridge-tapo-camera](https://github.com/kopiro/homebridge-tapo-camera)
+(all credit for the Tapo API client, ONVIF motion events, and toggle
+accessories) that replaces the `homebridge-camera-ffmpeg` streaming layer
+entirely.
 
-![photo_2021-11-23 11 57 48](https://user-images.githubusercontent.com/839700/143013358-9f6eed44-3aad-40b0-b1e5-ddc2c5bb24e4.png)
+## Why
 
-The plugin exposes the camera RTSP video feed, and toggle accessories to configure your automations.
+With the upstream design, every HomeKit session and snapshot opens its own
+RTSP connection to the camera:
 
-If your video feed is not working, try to check if any of the parameters at the video config can be tuned. You can use [https://homebridge-plugins.github.io/homebridge-camera-ffmpeg/configs](https://homebridge-plugins.github.io/homebridge-camera-ffmpeg/configs) to check if someone has already found the right values for your camera.
+| Problem | ng |
+|---|---|
+| Tapo caps concurrent RTSP clients (~2–4) | Camera sees exactly 2 connections, ever, regardless of viewers |
+| Stream-open waits for the camera's next keyframe (~2 s) | Instant start from the relay's GOP cache |
+| A WiFi blip kills the live session (spinner until manual retry) | Relay reconnects behind the scenes; sessions respawn automatically |
+| `copy` mode ignores HomeKit negotiation — remote viewers get 1080p/2 Mbps through a ~300 kbps relay budget | Per-session tier selection + encode-to-budget when needed |
+| Snapshots pull RTSP and wait for a keyframe (seconds) | Milliseconds from the relay's frame endpoint, cached |
 
-> [!IMPORTANT]
-> ~On firmware build 230921 and higher, [please follow this guide](https://github.com/JurajNyiri/HomeAssistant-Tapo-Control/blob/main/add_camera_with_new_firmware.md) to make your camera compatible with this integration.~
-> 
-> **Update March 2025**
-> In the Tapo app, go to "Me" (bottom right), then "Tapo Lab", then "Third-Party Compatibility", change to "On" and the integration should start working again.
-> 
+## How it works
 
-### Toggle accessories
-
-- _"Eyes"_ controls the privacy mode; when it's on it means that the camera is able to see
-(this is to make sure we support the command "Hey Siri, turn _on_ Camera", as this will _disable_ privacy mode).
-
-- _"Alarm"_ switches on/off the alarm sound.
-
-- _"Notifications"_ switches on/off the notifications sent to your TAPO app.
-
-- _"Motion Detection"_ switches on/off the motion detection system.
-
-- _"LED"_ switches on/off the LED.
-
-- _"Floodlight"_ switches on/off the floodlight (only for supported cameras, opt-in via config).
-
-An example Home automation could be:
-
-- When leaving home, enable *Eyes, Alarm, Notifications, Motion Detection, LED*
-- When arriving home:
-	- If you care about your privacy, disable *Eyes* to switch on privacy mode
-	- If you want the camera always on, but no notifications, just disable *Alarm* and *Notifications*
-
-### Motion sensor
-
-The motion detection sensor is built on top of the ONVIF protocol and it is enabled by default.
-
-Therefore you can set up automations and Homekit can send you notification in the Home app when motion is detected.
-
-Make sure you activate "Activity Notifications" in the "Status and Notifications" tab in the accessory.
-
-> [!NOTE]  
-> Some people may have issues resulting the plugin crashing at startup when this option is enabled. If you see an error like `Error: read ECONNRESET at TCP.onStreamRead` try to disable the motion sensor by setting `disableMotionSensorAccessory` to `true`
-
-## Installation
-
-You can install it via Homebridge UI or manually using:
-
-```sh
-npm -g install homebridge-tapo-camera
+```
+Tapo camera ──RTSP (stream1 + stream2, persistent)──► go2rtc relay (localhost only)
+                                                        │  GOP cache · auto-reconnect · frame.jpeg
+                        per-HomeKit-session ffmpeg ◄────┘
+                          tier: main (1080p) or sub (360p), chosen per negotiation
+                          mode: -c:v copy when the budget allows (zero CPU),
+                                encode-to-budget otherwise
+                          audio: pcm_alaw → AAC-ELD 16 kHz (libfdk_aac)
+                        ──► SRTP → HomeKit
 ```
 
-### Configuration
+- **TierPolicy**: local viewers typically copy the 1080p stream; Home-Hub
+  relay viewers get the 360p stream, re-encoded only if their negotiated
+  bitrate can't carry it as-is.
+- **RECONFIGURE** is honored: mid-stream quality changes respawn just the
+  session encoder; the SRTP session survives.
+- go2rtc (pinned, checksum-verified) is downloaded on install for
+  linux-arm64/amd64 and macOS arm64; override with `go2rtcPath`.
 
-It is highly recommended that you use either Homebridge Config UI X or the HOOBS UI to install and configure this plugin.
+## Install
 
-#### Expose only switches and sensors
-
-If your camera is already paired with HomeKit natively, you can use this plugin only for the TAPO controls that native HomeKit does not expose.
-
-Set `disableStreaming` to `true` to skip the Homebridge camera stream while keeping the toggle accessories. If you also do not want the ONVIF motion sensor, set `disableMotionSensorAccessory` to `true`; in that setup, `streamUser` and `streamPassword` are not required.
-
-```json
-{
-  "name": "My Camera Controls",
-  "ipAddress": "192.168.0.XXX",
-  "password": "your-tapo-password",
-  "disableStreaming": true,
-  "disableMotionSensorAccessory": true
-}
+```bash
+npm install -g homebridge-tapo-camera-ng
 ```
 
-To keep the ONVIF motion sensor enabled, provide `streamUser` and `streamPassword` from the TAPO app camera account.
+Configuration matches upstream (`platform: tapo-camera`, camera credentials,
+toggles, `pullInterval` in **milliseconds**), minus the `video*` /
+`lowQuality` options which are replaced by automatic tiering. New options:
+`disableAudio`, `forceTier` (`auto|main|sub`), `subBitrateKbps`, and
+platform-level `go2rtcPath`.
 
-### FFmpeg installation
+## Development
 
-The plugin should take care of installing the `ffmpeg` automatically.
+```bash
+npm install              # also downloads the pinned go2rtc for your platform
+npm run lint
+npm test                 # unit: exact ffmpeg argv, tier policy, relay config
+npm run test:integration # full pipeline with a synthetic camera — no hardware:
+                         # ffmpeg testsrc → go2rtc → session ffmpeg → SRTP sinks
+```
 
-> [!IMPORTANT]  
-> If you're getting errors like `FFmpeg exited with code: 1 and signal: null (Error)`, please follow the instructions here on how to install [ffmpeg-for-homebridge](https://github.com/homebridge/ffmpeg-for-homebridge) binaries manually.
+Design doc: `docs/superpowers/specs/2026-07-10-buffered-streaming-design.md`.
+
+## License
+
+ISC. Original plugin © Flavio De Stefano; ng streaming layer © Leon Fedotov.

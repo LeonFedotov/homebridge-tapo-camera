@@ -100,10 +100,24 @@
             "type": "boolean",
             "description": "Disables the Motion sensor accessory"
           },
-          "lowQuality": {
-            "title": "Low Quality",
+          "disableAudio": {
+            "title": "Disable Audio",
             "type": "boolean",
-            "description": "Video stream will be requested in low-quality instead of high-quality"
+            "description": "Disable one-way audio in HomeKit streams"
+          },
+          "forceTier": {
+            "title": "Force Stream Tier",
+            "type": "string",
+            "default": "auto",
+            "enum": ["auto", "main", "sub"],
+            "description": "Pin HomeKit sessions to the camera's high (main) or low (sub) quality stream instead of automatic per-session selection"
+          },
+          "subBitrateKbps": {
+            "title": "Sub Stream Bitrate (kbps)",
+            "type": "integer",
+            "placeholder": 1024,
+            "minimum": 64,
+            "description": "Approximate bitrate the camera produces on its low-quality stream — used to decide when a session can copy it as-is vs. re-encode down to the HomeKit-negotiated budget"
           },
           "eyesToggleAccessoryName": {
             "title": "Eyes (privacy mode) toggle Name",
@@ -140,66 +154,14 @@
             "type": "string",
             "placeholder": "Floodlight",
             "description": "Rename the Floodlight toggle"
-          },
-          "videoMaxWidth": {
-            "title": "Video Max Width",
-            "type": "integer",
-            "placeholder": 1280,
-            "multipleOf": 2,
-            "minimum": 0,
-            "description": "The maximum width used for video streamed to HomeKit. If set to 0, or videoCodec is set to 'copy' (default), the resolution of the source is used. If not set, will use any size HomeKit requests."
-          },
-          "videoMaxHeight": {
-            "title": "Video Max Height",
-            "type": "integer",
-            "placeholder": 720,
-            "multipleOf": 2,
-            "minimum": 0,
-            "description": "The maximum height used for video streamed to HomeKit. If set to 0, or videoCodec is set to 'copy' (default), the resolution of the source is used. If not set, will use any size HomeKit requests."
-          },
-          "videoMaxFPS": {
-            "title": "Video Max FPS",
-            "type": "integer",
-            "placeholder": 30,
-            "minimum": 0,
-            "description": "The maximum frame rate used for video streamed to HomeKit. If set to 0, or videoCodec is set to 'copy' (default), the framerate of the source is used. If not set, will use any framerate HomeKit requests."
-          },
-          "videoMaxBitrate": {
-            "title": "Video Max Bitrate",
-            "type": "integer",
-            "placeholder": 299,
-            "minimum": 0,
-            "description": "The maximum bitrate used for video streamed to HomeKit, in kbit/s. If not set, or videoCodec is set to 'copy' (default), it will use any bitrate HomeKit requests."
-          },
-          "videoPacketSize": {
-            "title": "Video Packet Size",
-            "type": "integer",
-            "placeholder": 1316,
-            "multipleOf": 188,
-            "minimum": 188,
-            "description": "If audio or video is choppy try a smaller value. If not set, or videoCodec is set to 'copy' (default), it will use any packet size HomeKit requests."
-          },
-          "videoForceMax": {
-            "title": "Force Max Video",
-            "type": "boolean",
-            "description": "If set, the settings requested by HomeKit will be overridden with any 'maximum' values defined in this config. If videoCodec is set to 'copy' (default), this setting set to true is useless."
-          },
-          "videoCodec": {
-            "title": "Video Codec",
-            "type": "string",
-            "placeholder": "copy",
-            "typeahead": {
-              "source": [
-                "libx264",
-                "h264_omx",
-                "h264_videotoolbox",
-                "copy"
-              ]
-            },
-            "description": "Set the codec used for encoding video sent to HomeKit, must be H.264-based. You can change to a hardware accelerated video codec with this option, if one is available. By default, we set 'copy' to avoid any video processing happening on the Homebridge server and disregarding any max values set above, but this also means possibly sending more video data to your devices than necessary, and some Homekit clients may not like not receiving the resolutions/fps they asked for. If you select a custom codec and your ffmpeg process is crashing, it most likely can't handle the video codec you've chosen."
           }
         }
       }
+    },
+    "go2rtcPath": {
+      "title": "go2rtc Binary Path",
+      "type": "string",
+      "description": "Optional path to a go2rtc binary. Defaults to the pinned version downloaded on install."
     }
   }
 }
