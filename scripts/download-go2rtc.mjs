@@ -17,6 +17,11 @@ const PLATFORMS = {
     asset: "go2rtc_linux_arm64",
     sha256: "359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50",
   },
+  // 32-bit userland Pis (armv6l/armv7l) report arch "arm"
+  "linux_arm": {
+    asset: "go2rtc_linux_arm",
+    sha256: "4d7e1639af5a2722a28e864468fd8099b3c1682565446c798bf9e3b38fde12e4",
+  },
   "linux_x64": {
     asset: "go2rtc_linux_amd64",
     sha256: "32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6",
