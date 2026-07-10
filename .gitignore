@@ -52,3 +52,5 @@ node_modules/
 .cache
 
 .env
+# downloaded by scripts/download-go2rtc.mjs
+/bin/
