@@ -30,6 +30,8 @@ export interface CameraPlatformConfig extends PlatformConfig {
   cameras?: CameraConfig[];
   htmlCameras?: HtmlCameraConfig[];
   mosaics?: MosaicConfig[];
+  /** When true, never create any mosaic — not even the automatic one for 2+ cameras. */
+  disableMosaics?: boolean;
   go2rtcPath?: string;
   surfPath?: string;
   htmlFfmpegPath?: string;
@@ -170,6 +172,10 @@ export class CameraPlatform implements IndependentPlatformPlugin {
   }
 
   private setupMosaics(): void {
+    if (this.config.disableMosaics) {
+      this.log.info("Mosaics disabled (disableMosaics) — skipping mosaic setup");
+      return;
+    }
     let mosaics = this.config.mosaics;
     if (!mosaics || mosaics.length === 0) {
       if (this.order.length < 2) return;

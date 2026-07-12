@@ -79,7 +79,7 @@ Rebuild and commit `dist/` with any `src/` change.
   WebKit regardless). Killing a WebKit process is futile — supervision respawns
   it; control lifetime via the render manager / config instead.
 - **Config surface** (`disableAudio`, `forceTier`, `subBitrateKbps`, camera
-  fields; `htmlCameras`, `mosaics`, `previewRefreshSeconds`, `go2rtcPath`,
+  fields; `htmlCameras`, `mosaics`, `disableMosaics`, `previewRefreshSeconds`, `go2rtcPath`,
   `surfPath`, `htmlFfmpegPath`) must stay in sync across `src/cameraAccessory.ts`
   / `src/cameraPlatform.ts` / `src/streaming/htmlRender.ts`, `config.schema.json`,
   and the README.

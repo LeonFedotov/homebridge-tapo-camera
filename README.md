@@ -135,12 +135,15 @@ Credentials and the toggle/motion accessories are unchanged from upstream
 Each `{ name, cameras: [...] }` tiles the listed cameras (by name; TAPO or HTML)
 into one HomeKit camera, in grid order. Omit `mosaics` for one automatic mosaic
 of all cameras (only created when there are 2+). Mosaics are capped at 10 fps
-and optimise for a smooth, low‑CPU glance rather than sharpness.
+and optimise for a smooth, low‑CPU glance rather than sharpness. Set
+`disableMosaics: true` to suppress every mosaic, including the automatic one — use
+this when you want each camera as its own tile and no combined grid.
 
 ### Platform options
 
 | Option | Meaning |
 |---|---|
+| `disableMosaics` | `true` = never create any mosaic, not even the automatic 2+‑camera one (default `false`) |
 | `go2rtcPath` | Path to a go2rtc binary (default: bundled, auto‑downloaded) |
 | `surfPath` | Path to `surf` for HTML cameras (default `/usr/bin/surf`) |
 | `htmlFfmpegPath` | Path to an x11grab‑capable ffmpeg (auto‑detected if unset) |
